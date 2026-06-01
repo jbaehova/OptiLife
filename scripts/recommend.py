@@ -10,6 +10,9 @@ SLOT_PATTERN = re.compile(
     r"^(Mon|Tue|Wed|Thu|Fri)\s+(\d{2}):(\d{2})-(\d{2}):(\d{2})$"
 )
 
+DEFAULT_DATA = ""  # 과목 CSV input 파일 경로
+DEFAULT_OUTPUT = ""  # TXT output 경로
+
 
 def parse_bool(value):
     if isinstance(value, bool):
@@ -179,12 +182,27 @@ def build_report(recommendations):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", default="data/courses.csv")
-    parser.add_argument("--output", default="outputs/recommendations.txt")
+    parser.add_argument(
+        "--data",
+        default=DEFAULT_DATA,
+        metavar="PATH",
+        help="CSV file path containing candidate courses for schedule recommendation.",
+    )
+    parser.add_argument(
+        "--output",
+        default=DEFAULT_OUTPUT,
+        metavar="PATH",
+        help="Text file path to write the recommendation report.",
+    )
     parser.add_argument("--min-credits", type=int, default=15)
     parser.add_argument("--max-credits", type=int, default=18)
     parser.add_argument("--limit", type=int, default=3)
     args = parser.parse_args()
+
+    if not args.data:
+        parser.error("--data 경로를 지정하거나 DEFAULT_DATA에 과목 CSV 경로를 입력하세요.")
+    if not args.output:
+        parser.error("--output 경로를 지정하거나 DEFAULT_OUTPUT에 결과 TXT 경로를 입력하세요.")
 
     courses = load_courses(args.data)
     recommendations = find_recommendations(
