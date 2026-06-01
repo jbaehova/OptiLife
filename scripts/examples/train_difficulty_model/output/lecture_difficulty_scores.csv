@@ -1,0 +1,6 @@
+lecture_id,course_name,professor,review_count,avg_predicted_difficulty,avg_labeled_difficulty,avg_workload_label
+1003,데이터베이스,최교수,5,2.8,3.0,3.0
+1005,운영체제,정교수,5,5.0,5.0,5.0
+1004,자료구조,김교수,5,3.8,4.0,4.0
+1001,컴퓨팅사고,이교수,5,1.8,1.0,1.2
+1002,프로그래밍기초,박교수,5,2.0,2.0,2.0
