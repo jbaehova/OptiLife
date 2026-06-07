@@ -13,11 +13,119 @@ SLOT_PATTERN = re.compile(
 DEFAULT_DATA = ""  # 과목 CSV input 파일 경로
 DEFAULT_OUTPUT = ""  # TXT output 경로
 
+DAY_LABELS = {
+    "Mon": "월요일",
+    "Tue": "화요일",
+    "Wed": "수요일",
+    "Thu": "목요일",
+    "Fri": "금요일",
+}
+
+DAY_ALIASES = {
+    "Mon": "Mon",
+    "Monday": "Mon",
+    "월": "Mon",
+    "월요일": "Mon",
+    "Tue": "Tue",
+    "Tuesday": "Tue",
+    "화": "Tue",
+    "화요일": "Tue",
+    "Wed": "Wed",
+    "Wednesday": "Wed",
+    "수": "Wed",
+    "수요일": "Wed",
+    "Thu": "Thu",
+    "Thursday": "Thu",
+    "목": "Thu",
+    "목요일": "Thu",
+    "Fri": "Fri",
+    "Friday": "Fri",
+    "금": "Fri",
+    "금요일": "Fri",
+}
+
+DEFAULT_PREFERENCES = {
+    "preferred_free_days": ["Fri"],
+    "avoid_early": True,
+    "avoid_friday_afternoon": True,
+    "balance_days": True,
+    "early_cutoff": "10:00",
+    "core_weight": 8.0,
+    "credit_weight": 1.5,
+    "difficulty_weight": 1.3,
+    "workload_weight": 1.1,
+    "free_day_bonus": 8.0,
+    "early_penalty": 2.0,
+    "no_early_bonus": 4.0,
+    "friday_afternoon_penalty": 5.0,
+    "daily_burden_limit": 9.0,
+    "daily_burden_penalty": 1.5,
+}
+
 
 def parse_bool(value):
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+def parse_float(value, default):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def normalize_day(value):
+    return DAY_ALIASES.get(str(value).strip())
+
+
+def parse_time_to_minutes(value, default):
+    match = re.match(r"^(\d{1,2}):(\d{2})$", str(value).strip())
+    if not match:
+        return parse_time_to_minutes(default, "10:00")
+    hour, minute = match.groups()
+    return to_minutes(hour, minute)
+
+
+def normalize_preferences(preferences=None):
+    normalized = dict(DEFAULT_PREFERENCES)
+    if preferences:
+        for key in DEFAULT_PREFERENCES:
+            if key in preferences and preferences[key] is not None:
+                normalized[key] = preferences[key]
+
+    free_days = normalized["preferred_free_days"]
+    if isinstance(free_days, str):
+        free_days = free_days.split(",")
+    normalized["preferred_free_days"] = [
+        day
+        for day in (normalize_day(day) for day in free_days)
+        if day in DAY_LABELS
+    ]
+
+    for key in ["avoid_early", "avoid_friday_afternoon", "balance_days"]:
+        normalized[key] = parse_bool(normalized[key])
+
+    for key in [
+        "core_weight",
+        "credit_weight",
+        "difficulty_weight",
+        "workload_weight",
+        "free_day_bonus",
+        "early_penalty",
+        "no_early_bonus",
+        "friday_afternoon_penalty",
+        "daily_burden_limit",
+        "daily_burden_penalty",
+    ]:
+        normalized[key] = parse_float(normalized[key], DEFAULT_PREFERENCES[key])
+
+    normalized["early_cutoff_minutes"] = parse_time_to_minutes(
+        normalized["early_cutoff"],
+        DEFAULT_PREFERENCES["early_cutoff"],
+    )
+    return normalized
 
 
 def load_courses(path):
@@ -77,7 +185,12 @@ def daily_burden(schedule):
     return burden_by_day
 
 
-def score_schedule(schedule):
+def format_day(day):
+    return DAY_LABELS.get(day, day)
+
+
+def score_schedule(schedule, preferences=None):
+    preferences = normalize_preferences(preferences)
     total_difficulty = sum(course["difficulty_label"] for course in schedule)
     total_workload = sum(course["workload_label"] for course in schedule)
     core_count = sum(1 for course in schedule if course["core"])
@@ -89,36 +202,51 @@ def score_schedule(schedule):
         for slot in parse_slots(course["time_slot"])
     ]
     friday_slots = [slot for slot in all_slots if slot[0] == "Fri"]
-    early_slots = [slot for slot in all_slots if slot[1] < 10 * 60]
+    early_slots = [
+        slot for slot in all_slots if slot[1] < preferences["early_cutoff_minutes"]
+    ]
     friday_afternoon_slots = [slot for slot in friday_slots if slot[1] >= 12 * 60]
 
     score = 100.0
-    score += core_count * 8
-    score += credits * 1.5
-    score -= total_difficulty * 1.3
-    score -= total_workload * 1.1
-    score -= len(early_slots) * 2.0
-    score -= len(friday_afternoon_slots) * 5.0
+    score += core_count * preferences["core_weight"]
+    score += credits * preferences["credit_weight"]
+    score -= total_difficulty * preferences["difficulty_weight"]
+    score -= total_workload * preferences["workload_weight"]
 
-    if not friday_slots:
-        score += 8
-    if not early_slots:
-        score += 4
+    if preferences["avoid_early"]:
+        score -= len(early_slots) * preferences["early_penalty"]
+        if not early_slots:
+            score += preferences["no_early_bonus"]
+
+    if preferences["avoid_friday_afternoon"]:
+        score -= (
+            len(friday_afternoon_slots)
+            * preferences["friday_afternoon_penalty"]
+        )
+
+    free_day_reasons = []
+    for day in preferences["preferred_free_days"]:
+        day_slots = [slot for slot in all_slots if slot[0] == day]
+        if not day_slots:
+            score += preferences["free_day_bonus"]
+            free_day_reasons.append(f"{format_day(day)} 공강")
 
     burden_penalty = 0
-    for burden in daily_burden(schedule).values():
-        burden_penalty += max(0, burden - 9)
-    score -= burden_penalty * 1.5
+    if preferences["balance_days"]:
+        for burden in daily_burden(schedule).values():
+            burden_penalty += max(0, burden - preferences["daily_burden_limit"])
+        score -= burden_penalty * preferences["daily_burden_penalty"]
 
     reasons = []
     reasons.append(f"전공필수 {core_count}개 포함")
     reasons.append(f"총 {credits}학점")
-    if not friday_slots:
-        reasons.append("금요일 수업 없음")
-    elif friday_afternoon_slots:
+    reasons.extend(free_day_reasons)
+    if preferences["avoid_friday_afternoon"] and friday_afternoon_slots:
         reasons.append("금요일 오후 수업 있음")
-    if not early_slots:
-        reasons.append("오전 10시 이전 수업 없음")
+    if preferences["avoid_early"] and not early_slots:
+        reasons.append(
+            f"{format_minutes(preferences['early_cutoff_minutes'])} 이전 수업 없음"
+        )
     if burden_penalty > 0:
         reasons.append("특정 요일 부담이 조금 몰림")
     reasons.append(f"난이도 합계 {total_difficulty}, 과제량 합계 {total_workload}")
@@ -126,8 +254,11 @@ def score_schedule(schedule):
     return score, reasons
 
 
-def find_recommendations(courses, min_credits, max_credits, limit):
+def find_recommendations(courses, min_credits, max_credits, limit, preferences=None):
     course_records = to_course_records(courses)
+    if not course_records:
+        return []
+
     min_course_credits = min(course["credits"] for course in course_records)
     max_course_credits = max(course["credits"] for course in course_records)
     min_count = max(1, math.ceil(min_credits / max_course_credits))
@@ -141,7 +272,7 @@ def find_recommendations(courses, min_credits, max_credits, limit):
                 continue
             if has_conflict(schedule):
                 continue
-            score, reasons = score_schedule(schedule)
+            score, reasons = score_schedule(schedule, preferences=preferences)
             candidates.append((score, schedule, reasons))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
