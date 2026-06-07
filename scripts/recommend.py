@@ -3,6 +3,7 @@ import itertools
 import math
 import os
 import re
+from pathlib import Path
 
 import pandas as pd
 
@@ -11,7 +12,23 @@ SLOT_PATTERN = re.compile(
 )
 
 DEFAULT_DATA = ""  # 과목 CSV input 파일 경로
+DEFAULT_REVIEW_DATA = ""  # 라벨링된 Everytime 리뷰 CSV input 파일 경로
 DEFAULT_OUTPUT = ""  # TXT output 경로
+
+DEFAULT_LABEL = 3
+
+REQUIRED_COURSE_COLUMNS = {
+    "course_name",
+    "credits",
+    "core",
+    "time_slot",
+}
+
+LABEL_COLUMNS = [
+    "difficulty_label",
+    "workload_label",
+    "grading_strictness_label",
+]
 
 DAY_LABELS = {
     "Mon": "월요일",
@@ -80,6 +97,19 @@ def normalize_day(value):
     return DAY_ALIASES.get(str(value).strip())
 
 
+def clean_string(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip()
+
+
+def parse_label(value, default=DEFAULT_LABEL):
+    parsed = parse_float(value, default)
+    if math.isnan(parsed):
+        parsed = default
+    return int(max(1, min(5, math.floor(parsed + 0.5))))
+
+
 def parse_time_to_minutes(value, default):
     match = re.match(r"^(\d{1,2}):(\d{2})$", str(value).strip())
     if not match:
@@ -128,13 +158,137 @@ def normalize_preferences(preferences=None):
     return normalized
 
 
-def load_courses(path):
-    courses = pd.read_csv(path)
-    courses["credits"] = courses["credits"].astype(int)
-    courses["core"] = courses["core"].apply(parse_bool)
-    courses["difficulty_label"] = courses["difficulty_label"].astype(int)
-    courses["workload_label"] = courses["workload_label"].astype(int)
-    return courses
+def validate_columns(frame, required_columns, path):
+    missing = sorted(required_columns - set(frame.columns))
+    if missing:
+        raise ValueError(
+            f"{path} is missing required columns: {', '.join(missing)}"
+        )
+
+
+def read_csv(path):
+    return pd.read_csv(path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
+
+
+def summarize_label_group(group):
+    summary = {
+        "review_count": int(len(group)),
+    }
+    for column in LABEL_COLUMNS:
+        values = pd.to_numeric(group[column], errors="coerce").dropna()
+        average = float(values.mean()) if not values.empty else DEFAULT_LABEL
+        summary[column] = parse_label(average)
+        summary[f"{column}_average"] = round(average, 2)
+    return summary
+
+
+def load_review_aggregates(path):
+    if not path:
+        return {"by_course_professor": {}, "by_course": {}}
+
+    review_path = Path(path)
+    if not review_path.exists():
+        raise FileNotFoundError(f"Labeled review CSV not found: {path}")
+
+    reviews = read_csv(review_path)
+    required_columns = {"course_name", *LABEL_COLUMNS}
+    validate_columns(reviews, required_columns, review_path)
+
+    reviews = reviews.copy()
+    reviews["course_name"] = reviews["course_name"].apply(clean_string)
+    if "professor" not in reviews.columns:
+        reviews["professor"] = ""
+    reviews["professor"] = reviews["professor"].apply(clean_string)
+    reviews = reviews[reviews["course_name"] != ""]
+
+    by_course_professor = {}
+    for (course_name, professor), group in reviews.groupby(
+        ["course_name", "professor"],
+        dropna=False,
+    ):
+        by_course_professor[(course_name, professor)] = summarize_label_group(group)
+
+    by_course = {}
+    for course_name, group in reviews.groupby("course_name", dropna=False):
+        by_course[course_name] = summarize_label_group(group)
+
+    return {
+        "by_course_professor": by_course_professor,
+        "by_course": by_course,
+    }
+
+
+def lookup_review_summary(course, review_aggregates):
+    course_name = clean_string(course.get("course_name", ""))
+    professor = clean_string(course.get("professor", ""))
+    return (
+        review_aggregates["by_course_professor"].get((course_name, professor))
+        or review_aggregates["by_course"].get(course_name)
+    )
+
+
+def course_csv_label_summary(course):
+    if not all(
+        column in course and clean_string(course[column]) != ""
+        for column in LABEL_COLUMNS[:2]
+    ):
+        return None
+
+    summary = {"review_count": 0}
+    for column in LABEL_COLUMNS:
+        if column in course and not pd.isna(course[column]):
+            label = parse_label(course[column])
+        else:
+            label = DEFAULT_LABEL
+        summary[column] = label
+        summary[f"{column}_average"] = float(label)
+    return summary
+
+
+def normalize_course_record(course, review_aggregates):
+    record = dict(course)
+    record["course_name"] = clean_string(record.get("course_name", ""))
+    record["professor"] = clean_string(record.get("professor", ""))
+    record["credits"] = int(record["credits"])
+    record["core"] = parse_bool(record["core"])
+    record["time_slot"] = clean_string(record["time_slot"])
+
+    review_summary = lookup_review_summary(record, review_aggregates)
+    csv_summary = course_csv_label_summary(record)
+    label_source = "labeled_reviews"
+    summary = review_summary
+    if summary is None:
+        summary = csv_summary
+        label_source = "course_csv"
+    if summary is None:
+        summary = {
+            "review_count": 0,
+            "difficulty_label": DEFAULT_LABEL,
+            "difficulty_label_average": float(DEFAULT_LABEL),
+            "workload_label": DEFAULT_LABEL,
+            "workload_label_average": float(DEFAULT_LABEL),
+            "grading_strictness_label": DEFAULT_LABEL,
+            "grading_strictness_label_average": float(DEFAULT_LABEL),
+        }
+        label_source = "default"
+
+    for column in LABEL_COLUMNS:
+        record[column] = int(summary[column])
+        record[f"{column}_average"] = float(summary[f"{column}_average"])
+    record["review_count"] = int(summary["review_count"])
+    record["label_source"] = label_source
+    return record
+
+
+def load_courses(path, review_path=None):
+    courses = read_csv(path)
+    validate_columns(courses, REQUIRED_COURSE_COLUMNS, path)
+    review_aggregates = load_review_aggregates(review_path)
+    records = [
+        normalize_course_record(course, review_aggregates)
+        for course in courses.to_dict("records")
+    ]
+    return pd.DataFrame(records)
 
 
 def to_course_records(courses):
@@ -325,6 +479,12 @@ def main():
         metavar="PATH",
         help="Text file path to write the recommendation report.",
     )
+    parser.add_argument(
+        "--reviews",
+        default=DEFAULT_REVIEW_DATA,
+        metavar="PATH",
+        help="CSV file path containing labeled Everytime reviews.",
+    )
     parser.add_argument("--min-credits", type=int, default=15)
     parser.add_argument("--max-credits", type=int, default=18)
     parser.add_argument("--limit", type=int, default=3)
@@ -335,7 +495,7 @@ def main():
     if not args.output:
         parser.error("--output 경로를 지정하거나 DEFAULT_OUTPUT에 결과 TXT 경로를 입력하세요.")
 
-    courses = load_courses(args.data)
+    courses = load_courses(args.data, args.reviews or None)
     recommendations = find_recommendations(
         courses,
         min_credits=args.min_credits,

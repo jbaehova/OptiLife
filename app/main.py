@@ -1,4 +1,8 @@
+import csv
+import math
 import os
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -21,9 +25,15 @@ from scripts.recommend import (
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = PROJECT_ROOT / "app" / "static"
 CANONICAL_COURSES_PATH = PROJECT_ROOT / "data" / "csv" / "courses.csv"
+CANONICAL_RAW_REVIEWS_PATH = PROJECT_ROOT / "data" / "csv" / "raw_everytime_reviews.csv"
+CANONICAL_LABELED_REVIEWS_PATH = (
+    PROJECT_ROOT / "data" / "csv" / "labeled_everytime_reviews.csv"
+)
+LABELING_SUMMARY_PATH = PROJECT_ROOT / "outputs" / "review_labeling_summary.txt"
 SAMPLE_COURSES_PATH = (
     PROJECT_ROOT / "scripts" / "examples" / "recommend" / "input" / "courses.csv"
 )
+LABELING_SCRIPT_PATH = PROJECT_ROOT / "scripts" / "label_everytime_reviews.py"
 
 app = FastAPI(title="OptiLife", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -79,6 +89,40 @@ def resolve_course_path() -> Path:
     return SAMPLE_COURSES_PATH
 
 
+def resolve_raw_review_path() -> Path:
+    configured = os.environ.get("OPTILIFE_RAW_REVIEWS_CSV")
+    if configured:
+        return Path(configured).expanduser()
+    return CANONICAL_RAW_REVIEWS_PATH
+
+
+def resolve_labeled_review_path() -> Path:
+    configured = os.environ.get("OPTILIFE_LABELED_REVIEWS_CSV")
+    if configured:
+        return Path(configured).expanduser()
+    return CANONICAL_LABELED_REVIEWS_PATH
+
+
+def csv_info(path: Path) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "path": display_path(path),
+        "exists": path.exists(),
+        "row_count": 0,
+        "columns": [],
+    }
+    if not path.exists():
+        return info
+
+    with open(path, encoding="utf-8-sig", newline="") as file:
+        reader = csv.reader(file)
+        try:
+            info["columns"] = next(reader)
+        except StopIteration:
+            return info
+        info["row_count"] = sum(1 for _ in reader)
+    return info
+
+
 def load_course_records() -> tuple[Path, List[Dict[str, Any]]]:
     path = resolve_course_path()
     if not path.exists():
@@ -87,22 +131,54 @@ def load_course_records() -> tuple[Path, List[Dict[str, Any]]]:
             detail=f"Course CSV not found: {display_path(path)}",
         )
 
+    review_path = resolve_labeled_review_path()
+    review_input = review_path if review_path.exists() else None
     try:
-        records = load_courses(path).to_dict("records")
+        records = load_courses(path, review_input).to_dict("records")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     return path, [serialize_course(course) for course in records]
 
 
+def clean_api_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, float) and math.isnan(value):
+        return None
+    return value
+
+
+def clean_api_string(value: Any) -> str:
+    cleaned = clean_api_value(value)
+    if cleaned is None:
+        return ""
+    return str(cleaned)
+
+
 def serialize_course(course: Dict[str, Any]) -> Dict[str, Any]:
     return {
-        "course_name": str(course["course_name"]),
+        "course_id": clean_api_string(course.get("course_id", "")),
+        "course_name": clean_api_string(course["course_name"]),
+        "department": clean_api_string(course.get("department", "")),
+        "section": clean_api_string(course.get("section", "")),
+        "professor": clean_api_string(course.get("professor", "")),
+        "category": clean_api_string(course.get("category", "")),
         "credits": int(course["credits"]),
         "core": bool(course["core"]),
         "difficulty_label": int(course["difficulty_label"]),
         "workload_label": int(course["workload_label"]),
-        "time_slot": str(course["time_slot"]),
+        "grading_strictness_label": int(course.get("grading_strictness_label", 3)),
+        "difficulty_average": float(course.get("difficulty_label_average", 3)),
+        "workload_average": float(course.get("workload_label_average", 3)),
+        "grading_strictness_average": float(
+            course.get("grading_strictness_label_average", 3)
+        ),
+        "review_count": int(course.get("review_count", 0)),
+        "label_source": clean_api_string(course.get("label_source", "")),
+        "time_slot": clean_api_string(course["time_slot"]),
+        "campus": clean_api_string(course.get("campus", "")),
+        "classroom": clean_api_string(course.get("classroom", "")),
     }
 
 
@@ -169,6 +245,30 @@ def condition_to_preferences(condition: Dict[str, Any]) -> Dict[str, Any]:
     return preferences
 
 
+def build_dataset_status() -> Dict[str, Any]:
+    path, courses = load_course_records()
+    raw_path = resolve_raw_review_path()
+    labeled_path = resolve_labeled_review_path()
+    courses_below_review_floor = [
+        course["course_name"]
+        for course in courses
+        if course["review_count"] < 10
+    ]
+    return {
+        "courses": csv_info(path),
+        "raw_reviews": csv_info(raw_path),
+        "labeled_reviews": csv_info(labeled_path),
+        "course_count": len(courses),
+        "review_floor": 10,
+        "courses_below_review_floor": courses_below_review_floor,
+        "ready": (
+            bool(courses)
+            and not courses_below_review_floor
+            and labeled_path.exists()
+        ),
+    }
+
+
 @app.middleware("http")
 async def add_no_cache_headers(request: Request, call_next):
     response = await call_next(request)
@@ -218,15 +318,20 @@ def favicon() -> Response:
 def health() -> Dict[str, Any]:
     path, courses = load_course_records()
     using_sample = path == SAMPLE_COURSES_PATH
+    dataset = build_dataset_status()
     return {
         "ok": True,
         "course_count": len(courses),
         "data_source": display_path(path),
+        "review_data_source": display_path(resolve_labeled_review_path()),
         "data_status": "sample" if using_sample else "ready",
+        "dataset": dataset,
         "flow": [
-            "condition_ui",
-            "condition_data",
+            "raw_everytime_reviews",
+            "ai_labeling",
+            "labeled_review_csv",
             "course_csv",
+            "condition_ui",
             "schedule_recommendation",
         ],
     }
@@ -237,7 +342,61 @@ def courses() -> Dict[str, Any]:
     path, records = load_course_records()
     return {
         "data_source": display_path(path),
+        "review_data_source": display_path(resolve_labeled_review_path()),
         "courses": records,
+    }
+
+
+@app.get("/api/admin/datasets")
+def admin_datasets() -> Dict[str, Any]:
+    return build_dataset_status()
+
+
+@app.post("/api/admin/sync-reviews")
+def sync_reviews() -> Dict[str, Any]:
+    raw_path = resolve_raw_review_path()
+    labeled_path = resolve_labeled_review_path()
+    if not raw_path.exists():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Raw review CSV not found: {display_path(raw_path)}",
+        )
+
+    LABELING_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    command = [
+        sys.executable,
+        str(LABELING_SCRIPT_PATH),
+        "--input",
+        str(raw_path),
+        "--output",
+        str(labeled_path),
+        "--summary",
+        str(LABELING_SUMMARY_PATH),
+        "--merge-existing",
+    ]
+    result = subprocess.run(
+        command,
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "message": "Review labeling script failed.",
+                "stdout": result.stdout,
+                "stderr": result.stderr,
+            },
+        )
+
+    return {
+        "ok": True,
+        "message": "리뷰 동기화 완료",
+        "stdout": result.stdout.strip(),
+        "summary_path": display_path(LABELING_SUMMARY_PATH),
+        "dataset": build_dataset_status(),
     }
 
 
@@ -263,6 +422,7 @@ def recommend(condition_data: ConditionData) -> Dict[str, Any]:
     return {
         "condition_data": condition,
         "data_source": display_path(path),
+        "review_data_source": display_path(resolve_labeled_review_path()),
         "course_count": len(courses),
         "recommendations": [
             serialize_recommendation(rank, score, list(schedule), reasons)
