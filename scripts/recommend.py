@@ -302,9 +302,14 @@ def to_minutes(hour, minute):
 
 
 def parse_slots(time_slot):
+    if not clean_string(time_slot):
+        return []
+
     slots = []
     for raw_slot in time_slot.split(";"):
         slot = raw_slot.strip()
+        if not slot:
+            continue
         match = SLOT_PATTERN.match(slot)
         if not match:
             raise ValueError(f"Invalid time slot: {slot}")
