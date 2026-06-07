@@ -15,14 +15,50 @@
         <div class="muted">조건 기반 시간표 MVP</div>
       </div>
       <div class="flow" aria-label="pipeline">
-        <span>조건 UI</span>
-        <span>조건 데이터</span>
+        <span>원본 리뷰</span>
+        <span>AI 라벨</span>
+        <span>과목 목록</span>
         <span>추천 결과</span>
       </div>
       <div id="apiStatus" class="status">연결 확인</div>
     </header>
 
     <main class="shell">
+      <section class="panel admin-panel" aria-label="데이터 관리">
+        <div class="section-title">
+          <span>데이터 관리</span>
+          <button class="ghost-button" type="button" id="syncReviewsButton">리뷰 해석 및 동기화</button>
+        </div>
+
+        <div class="dataset-grid">
+          <div class="dataset-item">
+            <span>과목 목록 CSV</span>
+            <strong id="coursesDatasetCount">-</strong>
+            <small id="coursesDatasetPath">-</small>
+          </div>
+
+          <div class="dataset-item">
+            <span>원본 리뷰 CSV</span>
+            <strong id="rawReviewsDatasetCount">-</strong>
+            <small id="rawReviewsDatasetPath">-</small>
+          </div>
+
+          <div class="dataset-item">
+            <span>라벨 리뷰 CSV</span>
+            <strong id="labeledReviewsDatasetCount">-</strong>
+            <small id="labeledReviewsDatasetPath">-</small>
+          </div>
+
+          <div class="dataset-item">
+            <span>리뷰 보강 상태</span>
+            <strong id="reviewFloorStatus">-</strong>
+            <small id="reviewFloorDetail">-</small>
+          </div>
+        </div>
+
+        <div id="syncMessage" class="sync-message">동기화 대기</div>
+      </section>
+
       <section class="panel controls" aria-label="조건">
         <form id="conditionForm">
           <div class="section-title">

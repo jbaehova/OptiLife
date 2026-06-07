@@ -134,6 +134,12 @@ button {
   padding: 18px 20px 20px;
 }
 
+.admin-panel {
+  display: grid;
+  gap: 12px;
+  padding: 16px 18px 18px;
+}
+
 .inspector {
   align-self: start;
   padding: 16px;
@@ -420,6 +426,66 @@ input[type="range"] {
   background: var(--surface-soft);
 }
 
+button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.dataset-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.dataset-item {
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fbfcfc;
+}
+
+.dataset-item span,
+.dataset-item strong,
+.dataset-item small {
+  display: block;
+  min-width: 0;
+}
+
+.dataset-item span {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 680;
+}
+
+.dataset-item strong {
+  margin-top: 4px;
+  font-size: 18px;
+}
+
+.dataset-item small {
+  margin-top: 5px;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.sync-message {
+  min-height: 18px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.sync-message.ready {
+  color: var(--accent-strong);
+}
+
+.sync-message.error {
+  color: #a1382d;
+}
+
 .tabs {
   display: flex;
   gap: 8px;
@@ -659,6 +725,10 @@ input[type="range"] {
   .results-area {
     grid-template-columns: minmax(0, 1fr);
   }
+
+  .dataset-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 @media (max-width: 760px) {
@@ -683,7 +753,8 @@ input[type="range"] {
   }
 
   .condition-body,
-  .condition-fields {
+  .condition-fields,
+  .dataset-grid {
     grid-template-columns: 1fr;
   }
 

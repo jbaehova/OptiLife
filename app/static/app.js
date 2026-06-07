@@ -29,6 +29,7 @@ const state = {
 const els = {
   form: document.querySelector("#conditionForm"),
   resetButton: document.querySelector("#resetButton"),
+  syncReviewsButton: document.querySelector("#syncReviewsButton"),
   resultsArea: document.querySelector("#resultsArea"),
   apiStatus: document.querySelector("#apiStatus"),
   resultTitle: document.querySelector("#resultTitle"),
@@ -49,6 +50,15 @@ const els = {
   coreWeight: document.querySelector("#coreWeight"),
   difficultyWeight: document.querySelector("#difficultyWeight"),
   workloadWeight: document.querySelector("#workloadWeight"),
+  coursesDatasetCount: document.querySelector("#coursesDatasetCount"),
+  coursesDatasetPath: document.querySelector("#coursesDatasetPath"),
+  rawReviewsDatasetCount: document.querySelector("#rawReviewsDatasetCount"),
+  rawReviewsDatasetPath: document.querySelector("#rawReviewsDatasetPath"),
+  labeledReviewsDatasetCount: document.querySelector("#labeledReviewsDatasetCount"),
+  labeledReviewsDatasetPath: document.querySelector("#labeledReviewsDatasetPath"),
+  reviewFloorStatus: document.querySelector("#reviewFloorStatus"),
+  reviewFloorDetail: document.querySelector("#reviewFloorDetail"),
+  syncMessage: document.querySelector("#syncMessage"),
 };
 
 function toNumber(value, fallback) {
@@ -93,6 +103,11 @@ function setStatus(text, type = "") {
   els.apiStatus.className = `status ${type}`.trim();
 }
 
+function setSyncMessage(text, type = "") {
+  els.syncMessage.textContent = text;
+  els.syncMessage.className = `sync-message ${type}`.trim();
+}
+
 function showResults() {
   els.resultsArea.hidden = false;
 }
@@ -132,9 +147,40 @@ async function loadHealth() {
   const health = await getJson("/api/health");
   els.courseCount.textContent = health.course_count;
   els.dataSource.textContent = health.data_source;
+  renderDatasetStatus(health.dataset);
   state.healthStatusText =
-    health.data_status === "sample" ? "샘플 CSV 사용 중" : "CSV 준비됨";
+    health.dataset.ready ? "CSV 준비됨" : "데이터 확인 필요";
   setStatus(state.healthStatusText, "ready");
+}
+
+function datasetCountLabel(dataset, unit) {
+  if (!dataset.exists) {
+    return "없음";
+  }
+  return `${dataset.row_count}${unit}`;
+}
+
+function renderDatasetStatus(dataset) {
+  els.coursesDatasetCount.textContent = datasetCountLabel(dataset.courses, "개");
+  els.coursesDatasetPath.textContent = dataset.courses.path;
+  els.rawReviewsDatasetCount.textContent = datasetCountLabel(
+    dataset.raw_reviews,
+    "개",
+  );
+  els.rawReviewsDatasetPath.textContent = dataset.raw_reviews.path;
+  els.labeledReviewsDatasetCount.textContent = datasetCountLabel(
+    dataset.labeled_reviews,
+    "개",
+  );
+  els.labeledReviewsDatasetPath.textContent = dataset.labeled_reviews.path;
+
+  const missingCount = dataset.courses_below_review_floor.length;
+  els.reviewFloorStatus.textContent =
+    missingCount === 0 ? "충족" : `${missingCount}개 부족`;
+  els.reviewFloorDetail.textContent =
+    missingCount === 0
+      ? `과목별 라벨 리뷰 ${dataset.review_floor}개 이상`
+      : dataset.courses_below_review_floor.join(", ");
 }
 
 async function requestRecommendations() {
@@ -155,6 +201,22 @@ async function requestRecommendations() {
   state.recommendations = data.recommendations;
   state.selectedIndex = 0;
   renderResults();
+}
+
+async function syncReviews() {
+  els.syncReviewsButton.disabled = true;
+  setSyncMessage("리뷰 라벨링 실행 중");
+  try {
+    const data = await getJson("/api/admin/sync-reviews", { method: "POST" });
+    renderDatasetStatus(data.dataset);
+    setSyncMessage(data.message || data.stdout || "리뷰 동기화 완료", "ready");
+    state.healthStatusText = data.dataset.ready ? "CSV 준비됨" : "데이터 확인 필요";
+    setStatus(state.healthStatusText, "ready");
+  } catch (error) {
+    setSyncMessage(error.message, "error");
+  } finally {
+    els.syncReviewsButton.disabled = false;
+  }
 }
 
 function renderResults() {
@@ -324,6 +386,8 @@ els.resetButton.addEventListener("click", async () => {
   hideResults();
   setStatus(state.healthStatusText || "조건 입력 대기", "ready");
 });
+
+els.syncReviewsButton.addEventListener("click", syncReviews);
 
 els.tabs.addEventListener("click", (event) => {
   const button = event.target.closest("[data-index]");
