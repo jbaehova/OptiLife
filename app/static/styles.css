@@ -590,17 +590,13 @@ h1 {
   box-shadow: var(--shadow);
 }
 
-.event.level-high {
+.event.event-core {
   background: #18181b;
   color: #ffffff;
 }
 
-.event.level-mid {
+.event.event-elective {
   background: #f4f4f5;
-}
-
-.event.level-low {
-  background: #ffffff;
 }
 
 .event strong,

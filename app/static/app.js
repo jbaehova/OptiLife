@@ -280,19 +280,8 @@ function minutesToPercent(minutes) {
   return ((minutes - start) / (end - start)) * 100;
 }
 
-function eventLevel(block) {
-  const lowestScore = Math.min(
-    block.workload_label,
-    block.teamwork_load_label,
-    block.grading_strictness_label,
-  );
-  if (lowestScore <= 2) {
-    return "level-high";
-  }
-  if (lowestScore <= 3) {
-    return "level-mid";
-  }
-  return "level-low";
+function eventClass(block) {
+  return block.core ? "event-core" : "event-elective";
 }
 
 function groupBlocksByDay(blocks) {
@@ -327,10 +316,11 @@ function renderCalendar(blocks) {
             7,
             minutesToPercent(block.end_minutes) - minutesToPercent(block.start_minutes),
           );
+          const courseType = block.core ? "전공필수" : `${block.credits}학점`;
           return `
-            <div class="event ${eventLevel(block)}" style="top:${top}%;height:${height}%">
+            <div class="event ${eventClass(block)}" style="top:${top}%;height:${height}%">
               <strong>${escapeHtml(block.course_name)}</strong>
-              <span>${escapeHtml(block.start)}-${escapeHtml(block.end)}</span>
+              <span>${escapeHtml(block.start)}-${escapeHtml(block.end)} · ${escapeHtml(courseType)}</span>
             </div>`;
         })
         .join("");
