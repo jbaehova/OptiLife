@@ -1,0 +1,7 @@
+target,model,accuracy,macro_f1
+workload_label,majority_class,0.5714,0.2424
+workload_label,tfidf_logistic_regression,0.7143,0.463
+teamwork_load_label,majority_class,1.0,1.0
+teamwork_load_label,tfidf_logistic_regression,1.0,1.0
+grading_strictness_label,majority_class,1.0,1.0
+grading_strictness_label,tfidf_logistic_regression,1.0,1.0

@@ -1,4 +1,0 @@
-model,accuracy,macro_f1
-majority_class,0.2,0.0667
-tfidf_logistic_regression,0.4,0.2333
-tfidf_mlp,0.2,0.0667

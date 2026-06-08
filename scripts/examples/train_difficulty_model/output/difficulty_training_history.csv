@@ -1,4 +1,0 @@
-epoch,train_loss,test_loss,train_accuracy,test_accuracy
-1,1.608014,1.647562,0.2,0.2
-2,1.599119,1.642977,0.2,0.2
-3,1.590203,1.638572,0.2,0.2

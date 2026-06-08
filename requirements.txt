@@ -7,3 +7,4 @@ uvicorn[standard]
 requests
 beautifulsoup4
 playwright
+pytest

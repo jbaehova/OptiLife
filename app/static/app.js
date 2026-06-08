@@ -16,8 +16,10 @@ const defaults = {
   balanceDays: true,
   earlyCutoff: "10:00",
   coreWeight: 8,
-  difficultyWeight: 1.3,
+  ratingWeight: 1,
   workloadWeight: 1.1,
+  teamworkWeight: 0.8,
+  gradingWeight: 0.9,
 };
 
 const state = {
@@ -48,8 +50,10 @@ const els = {
   balanceDays: document.querySelector("#balanceDays"),
   earlyCutoff: document.querySelector("#earlyCutoff"),
   coreWeight: document.querySelector("#coreWeight"),
-  difficultyWeight: document.querySelector("#difficultyWeight"),
+  ratingWeight: document.querySelector("#ratingWeight"),
   workloadWeight: document.querySelector("#workloadWeight"),
+  teamworkWeight: document.querySelector("#teamworkWeight"),
+  gradingWeight: document.querySelector("#gradingWeight"),
   coursesDatasetCount: document.querySelector("#coursesDatasetCount"),
   coursesDatasetPath: document.querySelector("#coursesDatasetPath"),
   rawReviewsDatasetCount: document.querySelector("#rawReviewsDatasetCount"),
@@ -79,11 +83,10 @@ function buildCondition() {
     balance_days: els.balanceDays.checked,
     early_cutoff: els.earlyCutoff.value || defaults.earlyCutoff,
     core_weight: toNumber(els.coreWeight.value, defaults.coreWeight),
-    difficulty_weight: toNumber(
-      els.difficultyWeight.value,
-      defaults.difficultyWeight,
-    ),
+    rating_weight: toNumber(els.ratingWeight.value, defaults.ratingWeight),
     workload_weight: toNumber(els.workloadWeight.value, defaults.workloadWeight),
+    teamwork_weight: toNumber(els.teamworkWeight.value, defaults.teamworkWeight),
+    grading_weight: toNumber(els.gradingWeight.value, defaults.gradingWeight),
   };
 }
 
@@ -174,13 +177,14 @@ function renderDatasetStatus(dataset) {
   );
   els.labeledReviewsDatasetPath.textContent = dataset.labeled_reviews.path;
 
-  const missingCount = dataset.courses_below_review_floor.length;
+  const missing = dataset.courses_missing_evaluation || [];
+  const missingCount = missing.length;
   els.reviewFloorStatus.textContent =
-    missingCount === 0 ? "충족" : `${missingCount}개 부족`;
+    missingCount === 0 ? "충족" : `${missingCount}개 누락`;
   els.reviewFloorDetail.textContent =
     missingCount === 0
-      ? `과목별 라벨 리뷰 ${dataset.review_floor}개 이상`
-      : dataset.courses_below_review_floor.join(", ");
+      ? "에브리타임 평가 컬럼 준비됨"
+      : missing.join(", ");
 }
 
 async function requestRecommendations() {
@@ -255,10 +259,15 @@ function minutesToPercent(minutes) {
 }
 
 function eventLevel(block) {
-  if (block.difficulty_label >= 4 || block.workload_label >= 4) {
+  const lowestScore = Math.min(
+    block.workload_label,
+    block.teamwork_load_label,
+    block.grading_strictness_label,
+  );
+  if (lowestScore <= 2) {
     return "level-high";
   }
-  if (block.difficulty_label === 3 || block.workload_label === 3) {
+  if (lowestScore <= 3) {
     return "level-mid";
   }
   return "level-low";
@@ -316,13 +325,14 @@ function renderCalendar(blocks) {
 }
 
 function renderSummary(selected) {
+  const score = (value) => Number(value).toFixed(2);
   const courseItems = selected.courses
     .map((course) => {
       const core = course.core ? "전공필수" : "선택";
       return `
         <div class="summary-item">
           <strong>${escapeHtml(course.course_name)}</strong>
-          <span>${course.credits}학점 · ${core} · 난이도 ${course.difficulty_label} · 과제량 ${course.workload_label}</span>
+          <span>${course.credits}학점 · ${core} · 평점 ${score(course.rating)} · 과제 ${score(course.workload_label)} · 조모임 ${score(course.teamwork_load_label)} · 성적 ${score(course.grading_strictness_label)}</span>
         </div>`;
     })
     .join("");
@@ -363,8 +373,10 @@ function resetForm() {
   els.balanceDays.checked = defaults.balanceDays;
   els.earlyCutoff.value = defaults.earlyCutoff;
   els.coreWeight.value = defaults.coreWeight;
-  els.difficultyWeight.value = defaults.difficultyWeight;
+  els.ratingWeight.value = defaults.ratingWeight;
   els.workloadWeight.value = defaults.workloadWeight;
+  els.teamworkWeight.value = defaults.teamworkWeight;
+  els.gradingWeight.value = defaults.gradingWeight;
   updateRangeOutputs();
   updatePayload();
 }

@@ -1,12 +1,12 @@
 # OptiLife
 
-조건 기반 시간표 추천 MVP입니다. 에브리타임 리뷰를 AI 모델이 라벨링한 CSV와 학교 포털 과목 목록 CSV를 결합해, UI에서 받은 조건에 맞는 시간표를 추천합니다.
+조건 기반 시간표 추천 MVP입니다. 학교 포털 과목 목록과 에브리타임 평가 지표를 담은 `courses.csv`를 사용해, UI에서 받은 조건에 맞는 시간표를 추천합니다.
 
-현재 저장소에는 팀 개발을 위한 mock 데이터가 포함되어 있습니다.
+현재 저장소에는 팀 개발을 위한 mock 과목 데이터와 schema-only 리뷰 CSV가 포함되어 있습니다.
 
-- `data/csv/courses.csv`: 과목 목록 mock 12개
-- `data/csv/raw_everytime_reviews.csv`: 라벨링 전 mock 리뷰 100개
-- `data/csv/labeled_everytime_reviews.csv`: 기존 자료구조개론/알고리즘개론 라벨 리뷰 + mock 라벨 리뷰
+- `data/csv/courses.csv`: 과목 목록과 에브리타임 course-level 평가 컬럼
+- `data/csv/raw_everytime_reviews.csv`: 원본 리뷰 CSV 헤더
+- `data/csv/labeled_everytime_reviews.csv`: 라벨 리뷰 CSV 헤더
 
 ## 구조
 
@@ -15,7 +15,7 @@
 - `scripts/recommend.py`: 시간표 조합 생성 및 점수 계산
 - `scripts/extract_everytime_saved_html.py`: Everytime 저장 HTML/MHTML 리뷰 추출
 - `scripts/label_everytime_reviews.py`: 리뷰 약지도 라벨링
-- `scripts/train_difficulty_model.py`: TF-IDF 기반 난이도 모델 실험
+- `scripts/train_difficulty_model.py`: TF-IDF 기반 리뷰 라벨 모델 실험
 - `docs/data_contract.md`: raw review, labeled review, course catalog CSV 계약
 
 ## 실행
@@ -38,15 +38,18 @@ python3 -m uvicorn app.main:app --reload
 
 ```text
 data/csv/raw_everytime_reviews.csv
--> AI 라벨링
+-> 리뷰 라벨링
 -> data/csv/labeled_everytime_reviews.csv
--> data/csv/courses.csv와 조인
+-> 에브리타임 course-level 평가 수집
+-> data/csv/courses.csv
 -> UI 조건 기반 시간표 추천
 ```
 
 관리자 패널의 `리뷰 해석 및 동기화` 버튼은 `data/csv/raw_everytime_reviews.csv`를 입력으로 `scripts/label_everytime_reviews.py`를 실행하고, 결과를 `data/csv/labeled_everytime_reviews.csv`에 병합합니다.
 
 기존 labeled CSV에만 있는 리뷰는 삭제하지 않습니다. 같은 `review_id`가 있으면 갱신하고, 새 리뷰는 뒤에 추가합니다.
+
+추천 점수는 labeled review 집계값이 아니라 `courses.csv`의 `rating`, `workload_label`, `teamwork_load_label`, `grading_strictness_label`을 사용합니다.
 
 ## CSV 계약
 
@@ -64,16 +67,16 @@ python3 -m uvicorn app.main:app --reload
 과목 CSV의 추천 필수 컬럼은 아래와 같습니다.
 
 ```csv
-course_name,credits,core,time_slot
-자료구조개론,3,true,Mon 09:00-10:30;Wed 09:00-10:30
+course_name,credits,core,rating,workload_label,teamwork_load_label,grading_strictness_label,time_slot
+자료구조개론,3,true,4.2,2.4,4.7,3.1,Mon 09:00-10:30;Wed 09:00-10:30
 ```
 
-`time_slot`은 `Mon|Tue|Wed|Thu|Fri HH:MM-HH:MM` 형식을 세미콜론으로 연결합니다.
+`time_slot`은 `Mon|Tue|Wed|Thu|Fri HH:MM-HH:MM` 형식을 세미콜론으로 연결합니다. 에브리타임 3단계 평가는 `없음/너그러움=5`, `보통=3`, `많음/깐깐함=1`로 환산한 가중평균 숫자입니다.
 
 ## 주요 API
 
-- `GET /api/health`: 앱 상태, CSV 경로, row count, 과목별 라벨 리뷰 충족 여부
-- `GET /api/courses`: 과목 목록과 labeled review 집계 레이블
+- `GET /api/health`: 앱 상태, CSV 경로, row count, course-level 평가 컬럼 준비 여부
+- `GET /api/courses`: 과목 목록과 에브리타임 평가 지표
 - `POST /api/recommend`: UI 조건을 기반으로 시간표 추천
 - `GET /api/admin/datasets`: 관리자 데이터 상태
 - `POST /api/admin/sync-reviews`: raw review CSV를 라벨링해서 labeled review CSV에 병합
@@ -85,7 +88,6 @@ course_name,credits,core,time_slot
 ```bash
 python3 scripts/recommend.py \
   --data data/csv/courses.csv \
-  --reviews data/csv/labeled_everytime_reviews.csv \
   --output outputs/recommendations.txt
 ```
 
@@ -103,10 +105,9 @@ python3 scripts/label_everytime_reviews.py \
 
 ## 검증
 
-현재 별도 테스트 suite는 없습니다. 변경 후 최소한 아래 명령을 실행합니다.
-
 ```bash
 python3 -m compileall app scripts
+python3 -m pytest
 ```
 
 서버 실행 후 smoke test 예시는 아래와 같습니다.
