@@ -3,7 +3,6 @@ import itertools
 import math
 import os
 import re
-from pathlib import Path
 
 import pandas as pd
 
@@ -12,23 +11,30 @@ SLOT_PATTERN = re.compile(
 )
 
 DEFAULT_DATA = ""  # 과목 CSV input 파일 경로
-DEFAULT_REVIEW_DATA = ""  # 라벨링된 Everytime 리뷰 CSV input 파일 경로
+DEFAULT_REVIEW_DATA = ""  # Deprecated: 추천은 courses.csv의 에브리타임 평가값을 사용
 DEFAULT_OUTPUT = ""  # TXT output 경로
 
-DEFAULT_LABEL = 3
+DEFAULT_SCORE = 3.0
+DEFAULT_RATING = 3.0
 
 REQUIRED_COURSE_COLUMNS = {
     "course_name",
     "credits",
     "core",
     "time_slot",
+    "rating",
+    "workload_label",
+    "teamwork_load_label",
+    "grading_strictness_label",
 }
 
 LABEL_COLUMNS = [
-    "difficulty_label",
     "workload_label",
+    "teamwork_load_label",
     "grading_strictness_label",
 ]
+
+COURSE_SCORE_COLUMNS = ["rating", *LABEL_COLUMNS]
 
 DAY_LABELS = {
     "Mon": "월요일",
@@ -69,8 +75,10 @@ DEFAULT_PREFERENCES = {
     "early_cutoff": "10:00",
     "core_weight": 8.0,
     "credit_weight": 1.5,
-    "difficulty_weight": 1.3,
+    "rating_weight": 1.0,
     "workload_weight": 1.1,
+    "teamwork_weight": 0.8,
+    "grading_weight": 0.9,
     "free_day_bonus": 8.0,
     "early_penalty": 2.0,
     "no_early_bonus": 4.0,
@@ -103,11 +111,15 @@ def clean_string(value):
     return str(value).strip()
 
 
-def parse_label(value, default=DEFAULT_LABEL):
+def parse_score(value, default=DEFAULT_SCORE, low=1.0, high=5.0):
     parsed = parse_float(value, default)
     if math.isnan(parsed):
         parsed = default
-    return int(max(1, min(5, math.floor(parsed + 0.5))))
+    return round(max(low, min(high, parsed)), 2)
+
+
+def parse_rating(value, default=DEFAULT_RATING):
+    return parse_score(value, default=default, low=0.0, high=5.0)
 
 
 def parse_time_to_minutes(value, default):
@@ -140,8 +152,10 @@ def normalize_preferences(preferences=None):
     for key in [
         "core_weight",
         "credit_weight",
-        "difficulty_weight",
+        "rating_weight",
         "workload_weight",
+        "teamwork_weight",
+        "grading_weight",
         "free_day_bonus",
         "early_penalty",
         "no_early_bonus",
@@ -170,122 +184,25 @@ def read_csv(path):
     return pd.read_csv(path, encoding="utf-8-sig", dtype=str, keep_default_na=False)
 
 
-def summarize_label_group(group):
-    summary = {
-        "review_count": int(len(group)),
-    }
-    for column in LABEL_COLUMNS:
-        values = pd.to_numeric(group[column], errors="coerce").dropna()
-        average = float(values.mean()) if not values.empty else DEFAULT_LABEL
-        summary[column] = parse_label(average)
-        summary[f"{column}_average"] = round(average, 2)
-    return summary
-
-
-def load_review_aggregates(path):
-    if not path:
-        return {"by_course_professor": {}, "by_course": {}}
-
-    review_path = Path(path)
-    if not review_path.exists():
-        raise FileNotFoundError(f"Labeled review CSV not found: {path}")
-
-    reviews = read_csv(review_path)
-    required_columns = {"course_name", *LABEL_COLUMNS}
-    validate_columns(reviews, required_columns, review_path)
-
-    reviews = reviews.copy()
-    reviews["course_name"] = reviews["course_name"].apply(clean_string)
-    if "professor" not in reviews.columns:
-        reviews["professor"] = ""
-    reviews["professor"] = reviews["professor"].apply(clean_string)
-    reviews = reviews[reviews["course_name"] != ""]
-
-    by_course_professor = {}
-    for (course_name, professor), group in reviews.groupby(
-        ["course_name", "professor"],
-        dropna=False,
-    ):
-        by_course_professor[(course_name, professor)] = summarize_label_group(group)
-
-    by_course = {}
-    for course_name, group in reviews.groupby("course_name", dropna=False):
-        by_course[course_name] = summarize_label_group(group)
-
-    return {
-        "by_course_professor": by_course_professor,
-        "by_course": by_course,
-    }
-
-
-def lookup_review_summary(course, review_aggregates):
-    course_name = clean_string(course.get("course_name", ""))
-    professor = clean_string(course.get("professor", ""))
-    return (
-        review_aggregates["by_course_professor"].get((course_name, professor))
-        or review_aggregates["by_course"].get(course_name)
-    )
-
-
-def course_csv_label_summary(course):
-    if not all(
-        column in course and clean_string(course[column]) != ""
-        for column in LABEL_COLUMNS[:2]
-    ):
-        return None
-
-    summary = {"review_count": 0}
-    for column in LABEL_COLUMNS:
-        if column in course and not pd.isna(course[column]):
-            label = parse_label(course[column])
-        else:
-            label = DEFAULT_LABEL
-        summary[column] = label
-        summary[f"{column}_average"] = float(label)
-    return summary
-
-
-def normalize_course_record(course, review_aggregates):
+def normalize_course_record(course):
     record = dict(course)
     record["course_name"] = clean_string(record.get("course_name", ""))
     record["professor"] = clean_string(record.get("professor", ""))
     record["credits"] = int(record["credits"])
     record["core"] = parse_bool(record["core"])
     record["time_slot"] = clean_string(record["time_slot"])
-
-    review_summary = lookup_review_summary(record, review_aggregates)
-    csv_summary = course_csv_label_summary(record)
-    label_source = "labeled_reviews"
-    summary = review_summary
-    if summary is None:
-        summary = csv_summary
-        label_source = "course_csv"
-    if summary is None:
-        summary = {
-            "review_count": 0,
-            "difficulty_label": DEFAULT_LABEL,
-            "difficulty_label_average": float(DEFAULT_LABEL),
-            "workload_label": DEFAULT_LABEL,
-            "workload_label_average": float(DEFAULT_LABEL),
-            "grading_strictness_label": DEFAULT_LABEL,
-            "grading_strictness_label_average": float(DEFAULT_LABEL),
-        }
-        label_source = "default"
-
+    record["rating"] = parse_rating(record.get("rating", DEFAULT_RATING))
     for column in LABEL_COLUMNS:
-        record[column] = int(summary[column])
-        record[f"{column}_average"] = float(summary[f"{column}_average"])
-    record["review_count"] = int(summary["review_count"])
-    record["label_source"] = label_source
+        record[column] = parse_score(record.get(column, DEFAULT_SCORE))
     return record
 
 
 def load_courses(path, review_path=None):
+    _ = review_path
     courses = read_csv(path)
     validate_columns(courses, REQUIRED_COURSE_COLUMNS, path)
-    review_aggregates = load_review_aggregates(review_path)
     records = [
-        normalize_course_record(course, review_aggregates)
+        normalize_course_record(course)
         for course in courses.to_dict("records")
     ]
     return pd.DataFrame(records)
@@ -338,10 +255,16 @@ def has_conflict(schedule):
 def daily_burden(schedule):
     burden_by_day = {}
     for course in schedule:
-        burden = (course["difficulty_label"] + course["workload_label"]) / 2
+        burden = course_burden(course)
         for day, _, _ in parse_slots(course["time_slot"]):
             burden_by_day[day] = burden_by_day.get(day, 0) + burden
     return burden_by_day
+
+
+def course_burden(course):
+    return sum(6 - float(course[column]) for column in LABEL_COLUMNS) / len(
+        LABEL_COLUMNS
+    )
 
 
 def format_day(day):
@@ -350,8 +273,10 @@ def format_day(day):
 
 def score_schedule(schedule, preferences=None):
     preferences = normalize_preferences(preferences)
-    total_difficulty = sum(course["difficulty_label"] for course in schedule)
+    total_rating = sum(course["rating"] for course in schedule)
     total_workload = sum(course["workload_label"] for course in schedule)
+    total_teamwork = sum(course["teamwork_load_label"] for course in schedule)
+    total_grading = sum(course["grading_strictness_label"] for course in schedule)
     core_count = sum(1 for course in schedule if course["core"])
     credits = sum(course["credits"] for course in schedule)
 
@@ -369,8 +294,10 @@ def score_schedule(schedule, preferences=None):
     score = 100.0
     score += core_count * preferences["core_weight"]
     score += credits * preferences["credit_weight"]
-    score -= total_difficulty * preferences["difficulty_weight"]
-    score -= total_workload * preferences["workload_weight"]
+    score += total_rating * preferences["rating_weight"]
+    score += total_workload * preferences["workload_weight"]
+    score += total_teamwork * preferences["teamwork_weight"]
+    score += total_grading * preferences["grading_weight"]
 
     if preferences["avoid_early"]:
         score -= len(early_slots) * preferences["early_penalty"]
@@ -408,7 +335,11 @@ def score_schedule(schedule, preferences=None):
         )
     if burden_penalty > 0:
         reasons.append("특정 요일 부담이 조금 몰림")
-    reasons.append(f"난이도 합계 {total_difficulty}, 과제량 합계 {total_workload}")
+    reasons.append(
+        "평점 합계 "
+        f"{total_rating:.2f}, 과제 {total_workload:.2f}, "
+        f"조모임 {total_teamwork:.2f}, 성적 {total_grading:.2f}"
+    )
 
     return score, reasons
 
@@ -448,7 +379,9 @@ def format_schedule(rank, score, schedule, reasons):
         core_mark = "전공필수" if course["core"] else "선택"
         lines.append(
             f"- {course['course_name']} ({course['credits']}학점, {core_mark}, "
-            f"난이도 {course['difficulty_label']}, 과제량 {course['workload_label']})"
+            f"평점 {course['rating']:.2f}, 과제 {course['workload_label']:.2f}, "
+            f"조모임 {course['teamwork_load_label']:.2f}, "
+            f"성적 {course['grading_strictness_label']:.2f})"
         )
         for day, start, end in parse_slots(course["time_slot"]):
             lines.append(f"  - {day} {format_minutes(start)}-{format_minutes(end)}")
@@ -461,7 +394,7 @@ def build_report(recommendations):
         "시간표 추천 프로토타입 결과",
         "",
         "현재 버전은 PyTorch 학습 모델이 아니라, 데이터 구조와 추천 점수식을 먼저 검증하기 위한 간단한 프로토타입입니다.",
-        "충돌 없는 과목 조합을 만든 뒤 전공필수, 금요일 수업 여부, 이른 아침 수업 여부, 난이도, 과제량을 기준으로 점수를 계산합니다.",
+        "충돌 없는 과목 조합을 만든 뒤 전공필수, 금요일 수업 여부, 이른 아침 수업 여부, 평점, 과제, 조모임, 성적을 기준으로 점수를 계산합니다.",
         "",
     ]
     for index, (score, schedule, reasons) in enumerate(recommendations, start=1):
@@ -488,7 +421,7 @@ def main():
         "--reviews",
         default=DEFAULT_REVIEW_DATA,
         metavar="PATH",
-        help="CSV file path containing labeled Everytime reviews.",
+        help="Deprecated. Recommendation scores use course-level Everytime values in courses.csv.",
     )
     parser.add_argument("--min-credits", type=int, default=15)
     parser.add_argument("--max-credits", type=int, default=18)

@@ -211,9 +211,6 @@ def read_reviews(input_paths):
                         "semester": review["semester"],
                         "rating": review["rating"],
                         "raw_review_text": review["raw_review_text"],
-                        "difficulty_label": "",
-                        "workload_label": "",
-                        "grading_strictness_label": "",
                     }
                 )
     return rows
@@ -233,9 +230,6 @@ def write_csv(output_path, rows):
         "semester",
         "rating",
         "raw_review_text",
-        "difficulty_label",
-        "workload_label",
-        "grading_strictness_label",
     ]
     with open(output_path, "w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=fieldnames, lineterminator="\n")

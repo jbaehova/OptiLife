@@ -4,3 +4,4 @@ matplotlib
 joblib
 fastapi
 uvicorn[standard]
+pytest

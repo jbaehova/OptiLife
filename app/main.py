@@ -34,6 +34,12 @@ SAMPLE_COURSES_PATH = (
     PROJECT_ROOT / "scripts" / "examples" / "recommend" / "input" / "courses.csv"
 )
 LABELING_SCRIPT_PATH = PROJECT_ROOT / "scripts" / "label_everytime_reviews.py"
+COURSE_EVALUATION_COLUMNS = [
+    "rating",
+    "workload_label",
+    "teamwork_load_label",
+    "grading_strictness_label",
+]
 
 app = FastAPI(title="OptiLife", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
@@ -61,8 +67,10 @@ class ConditionData(BaseModel):
     balance_days: bool = True
     early_cutoff: str = "10:00"
     core_weight: float = Field(8.0, ge=0, le=20)
-    difficulty_weight: float = Field(1.3, ge=0, le=5)
+    rating_weight: float = Field(1.0, ge=0, le=5)
     workload_weight: float = Field(1.1, ge=0, le=5)
+    teamwork_weight: float = Field(0.8, ge=0, le=5)
+    grading_weight: float = Field(0.9, ge=0, le=5)
 
 
 def model_to_dict(model: BaseModel) -> Dict[str, Any]:
@@ -123,6 +131,28 @@ def csv_info(path: Path) -> Dict[str, Any]:
     return info
 
 
+def courses_missing_evaluation(path: Path) -> List[str]:
+    if not path.exists():
+        return []
+
+    missing_courses = []
+    with open(path, encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
+        for row in reader:
+            missing = [
+                column
+                for column in COURSE_EVALUATION_COLUMNS
+                if clean_api_string(row.get(column, "")) == ""
+            ]
+            if missing:
+                course_name = clean_api_string(row.get("course_name", ""))
+                section = clean_api_string(row.get("section", ""))
+                missing_courses.append(
+                    f"{course_name}({section})" if section else course_name
+                )
+    return missing_courses
+
+
 def load_course_records() -> tuple[Path, List[Dict[str, Any]]]:
     path = resolve_course_path()
     if not path.exists():
@@ -131,10 +161,8 @@ def load_course_records() -> tuple[Path, List[Dict[str, Any]]]:
             detail=f"Course CSV not found: {display_path(path)}",
         )
 
-    review_path = resolve_labeled_review_path()
-    review_input = review_path if review_path.exists() else None
     try:
-        records = load_courses(path, review_input).to_dict("records")
+        records = load_courses(path).to_dict("records")
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
@@ -166,16 +194,10 @@ def serialize_course(course: Dict[str, Any]) -> Dict[str, Any]:
         "category": clean_api_string(course.get("category", "")),
         "credits": int(course["credits"]),
         "core": bool(course["core"]),
-        "difficulty_label": int(course["difficulty_label"]),
-        "workload_label": int(course["workload_label"]),
-        "grading_strictness_label": int(course.get("grading_strictness_label", 3)),
-        "difficulty_average": float(course.get("difficulty_label_average", 3)),
-        "workload_average": float(course.get("workload_label_average", 3)),
-        "grading_strictness_average": float(
-            course.get("grading_strictness_label_average", 3)
-        ),
-        "review_count": int(course.get("review_count", 0)),
-        "label_source": clean_api_string(course.get("label_source", "")),
+        "rating": float(course["rating"]),
+        "workload_label": float(course["workload_label"]),
+        "teamwork_load_label": float(course["teamwork_load_label"]),
+        "grading_strictness_label": float(course["grading_strictness_label"]),
         "time_slot": clean_api_string(course["time_slot"]),
         "campus": clean_api_string(course.get("campus", "")),
         "classroom": clean_api_string(course.get("classroom", "")),
@@ -196,8 +218,9 @@ def serialize_blocks(course: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "course_name": course["course_name"],
                 "credits": course["credits"],
                 "core": course["core"],
-                "difficulty_label": course["difficulty_label"],
                 "workload_label": course["workload_label"],
+                "teamwork_load_label": course["teamwork_load_label"],
+                "grading_strictness_label": course["grading_strictness_label"],
             }
         )
     return blocks
@@ -220,8 +243,16 @@ def serialize_recommendation(
         "rank": rank,
         "score": round(float(score), 2),
         "credits": sum(course["credits"] for course in courses),
-        "difficulty_sum": sum(course["difficulty_label"] for course in courses),
-        "workload_sum": sum(course["workload_label"] for course in courses),
+        "rating_sum": round(sum(course["rating"] for course in courses), 2),
+        "workload_sum": round(sum(course["workload_label"] for course in courses), 2),
+        "teamwork_sum": round(
+            sum(course["teamwork_load_label"] for course in courses),
+            2,
+        ),
+        "grading_sum": round(
+            sum(course["grading_strictness_label"] for course in courses),
+            2,
+        ),
         "reasons": reasons,
         "courses": courses,
         "blocks": blocks,
@@ -249,23 +280,15 @@ def build_dataset_status() -> Dict[str, Any]:
     path, courses = load_course_records()
     raw_path = resolve_raw_review_path()
     labeled_path = resolve_labeled_review_path()
-    courses_below_review_floor = [
-        course["course_name"]
-        for course in courses
-        if course["review_count"] < 10
-    ]
+    missing_evaluation = courses_missing_evaluation(path)
     return {
         "courses": csv_info(path),
         "raw_reviews": csv_info(raw_path),
         "labeled_reviews": csv_info(labeled_path),
         "course_count": len(courses),
-        "review_floor": 10,
-        "courses_below_review_floor": courses_below_review_floor,
-        "ready": (
-            bool(courses)
-            and not courses_below_review_floor
-            and labeled_path.exists()
-        ),
+        "course_evaluation_columns": COURSE_EVALUATION_COLUMNS,
+        "courses_missing_evaluation": missing_evaluation,
+        "ready": bool(courses) and not missing_evaluation,
     }
 
 
@@ -330,7 +353,7 @@ def health() -> Dict[str, Any]:
             "raw_everytime_reviews",
             "ai_labeling",
             "labeled_review_csv",
-            "course_csv",
+            "course_everytime_metrics",
             "condition_ui",
             "schedule_recommendation",
         ],
