@@ -4,7 +4,7 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>OptiLife</title>
-    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23167a5a'/%3E%3Cpath d='M9 17l4 4 10-11' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23000'/%3E%3Cpath d='M10 22V10h12v12H10Zm3-3h6v-6h-6v6Z' fill='white'/%3E%3C/svg%3E">
     <link rel="stylesheet" href="/static/styles.css">
     <script defer src="/static/app.js"></script>
   </head>
@@ -12,54 +12,17 @@
     <header class="topbar">
       <div class="brand-block">
         <div class="brand">OptiLife</div>
-        <div class="muted">조건 기반 시간표 MVP</div>
+        <div class="muted">courses.csv 기반 시간표 추천</div>
       </div>
-      <div class="flow" aria-label="pipeline">
-        <span>원본 리뷰</span>
-        <span>AI 라벨</span>
-        <span>과목 목록</span>
-        <span>추천 결과</span>
+      <div class="top-meta">
+        <span id="courseCount">-</span>
+        <span id="dataSource">-</span>
       </div>
       <div id="apiStatus" class="status">연결 확인</div>
     </header>
 
-    <main class="shell">
-      <section class="panel admin-panel" aria-label="데이터 관리">
-        <div class="section-title">
-          <span>데이터 관리</span>
-          <button class="ghost-button" type="button" id="syncReviewsButton">리뷰 해석 및 동기화</button>
-        </div>
-
-        <div class="dataset-grid">
-          <div class="dataset-item">
-            <span>과목 목록 CSV</span>
-            <strong id="coursesDatasetCount">-</strong>
-            <small id="coursesDatasetPath">-</small>
-          </div>
-
-          <div class="dataset-item">
-            <span>원본 리뷰 CSV</span>
-            <strong id="rawReviewsDatasetCount">-</strong>
-            <small id="rawReviewsDatasetPath">-</small>
-          </div>
-
-          <div class="dataset-item">
-            <span>라벨 리뷰 CSV</span>
-            <strong id="labeledReviewsDatasetCount">-</strong>
-            <small id="labeledReviewsDatasetPath">-</small>
-          </div>
-
-          <div class="dataset-item">
-            <span>평가 데이터</span>
-            <strong id="reviewFloorStatus">-</strong>
-            <small id="reviewFloorDetail">-</small>
-          </div>
-        </div>
-
-        <div id="syncMessage" class="sync-message">동기화 대기</div>
-      </section>
-
-      <section class="panel controls" aria-label="조건">
+    <main class="shell app-workbench">
+      <aside class="panel controls" aria-label="조건">
         <form id="conditionForm">
           <div class="section-title">
             <span>조건</span>
@@ -69,94 +32,120 @@
             </div>
           </div>
 
-          <div class="condition-body">
-            <div class="condition-fields">
-              <label class="field two-col">
-                <span>최소 학점</span>
-                <input id="minCredits" name="min_credits" type="number" min="1" max="30" value="15">
-              </label>
-
-              <label class="field two-col">
-                <span>최대 학점</span>
-                <input id="maxCredits" name="max_credits" type="number" min="1" max="30" value="18">
-              </label>
-
-              <label class="field two-col">
-                <span>추천 수</span>
-                <input id="limit" name="limit" type="number" min="1" max="10" value="3">
-              </label>
-
-              <label class="field two-col time-field">
-                <span>이른 수업 기준</span>
-                <input id="earlyCutoff" name="early_cutoff" type="time" value="10:00">
-              </label>
+          <div class="data-strip" aria-label="데이터 상태">
+            <div>
+              <span>과목</span>
+              <strong id="coursesDatasetCount">-</strong>
             </div>
+            <div>
+              <span>전공필수</span>
+              <strong id="coreDatasetCount">-</strong>
+            </div>
+            <div>
+              <span>카테고리</span>
+              <strong id="categoryDatasetCount">-</strong>
+            </div>
+            <div>
+              <span>평가 컬럼</span>
+              <strong id="reviewFloorStatus">-</strong>
+            </div>
+          </div>
 
-            <div class="field day-field">
-              <span>공강 선호</span>
-              <div class="day-options" id="freeDays">
-                <label><input type="checkbox" value="Mon">월</label>
-                <label><input type="checkbox" value="Tue">화</label>
-                <label><input type="checkbox" value="Wed">수</label>
-                <label><input type="checkbox" value="Thu">목</label>
-                <label><input type="checkbox" value="Fri" checked>금</label>
+          <div class="condition-grid">
+            <div class="condition-section">
+              <div class="group-label">하드 조건</div>
+              <div class="field-grid">
+                <label class="field">
+                  <span>최소 학점</span>
+                  <input id="minCredits" name="min_credits" type="number" min="1" max="30" value="15">
+                </label>
+                <label class="field">
+                  <span>최대 학점</span>
+                  <input id="maxCredits" name="max_credits" type="number" min="1" max="30" value="18">
+                </label>
+                <label class="field">
+                  <span>전공필수 최소</span>
+                  <input id="coreMinCount" name="core_min_count" type="number" min="0" max="30" value="2">
+                </label>
+                <label class="field">
+                  <span>전공필수 최대</span>
+                  <input id="coreMaxCount" name="core_max_count" type="number" min="0" max="30" value="4">
+                </label>
+                <label class="field">
+                  <span>추천 수</span>
+                  <input id="limit" name="limit" type="number" min="1" max="10" value="3">
+                </label>
+              </div>
+
+              <div class="field category-field">
+                <span>카테고리</span>
+                <div class="segmented-options" id="categoryOptions"></div>
               </div>
             </div>
 
-            <div class="toggle-group" aria-label="회피 조건">
-              <label class="switch-row">
-                <input id="avoidEarly" type="checkbox" checked>
-                <span>이른 수업 회피</span>
-              </label>
+            <div class="condition-section">
+              <div class="group-label">선호 점수</div>
+              <div class="preference-grid">
+                <div class="field">
+                  <span>공강 선호</span>
+                  <div class="segmented-options day-options" id="freeDays">
+                    <label><input type="checkbox" value="Mon">월</label>
+                    <label><input type="checkbox" value="Tue">화</label>
+                    <label><input type="checkbox" value="Wed">수</label>
+                    <label><input type="checkbox" value="Thu">목</label>
+                    <label><input type="checkbox" value="Fri" checked>금</label>
+                  </div>
+                </div>
 
-              <label class="switch-row">
-                <input id="avoidFridayAfternoon" type="checkbox" checked>
-                <span>금요일 오후 회피</span>
-              </label>
+                <div class="toggle-group" aria-label="선호 조건">
+                  <label class="switch-row">
+                    <input id="avoidEarly" type="checkbox" checked>
+                    <span>이른 수업 회피</span>
+                  </label>
+                  <label class="switch-row">
+                    <input id="avoidFridayAfternoon" type="checkbox" checked>
+                    <span>금요일 오후 회피</span>
+                  </label>
+                  <label class="switch-row">
+                    <input id="balanceDays" type="checkbox" checked>
+                    <span>요일 부담 분산</span>
+                  </label>
+                </div>
 
-              <label class="switch-row">
-                <input id="balanceDays" type="checkbox" checked>
-                <span>요일 부담 분산</span>
-              </label>
-            </div>
+                <label class="field">
+                  <span>이른 수업 기준</span>
+                  <input id="earlyCutoff" name="early_cutoff" type="time" value="10:00">
+                </label>
+              </div>
 
-            <div class="weight-group">
-              <div class="group-label">가중치</div>
-              <label class="range-field">
-                <span>전공필수</span>
-                <input id="coreWeight" type="range" min="0" max="20" step="1" value="8">
-                <strong data-output-for="coreWeight">8</strong>
-              </label>
-
-              <label class="range-field">
-                <span>평점</span>
-                <input id="ratingWeight" type="range" min="0" max="5" step="0.1" value="1">
-                <strong data-output-for="ratingWeight">1</strong>
-              </label>
-
-              <label class="range-field">
-                <span>과제</span>
-                <input id="workloadWeight" type="range" min="0" max="5" step="0.1" value="1.1">
-                <strong data-output-for="workloadWeight">1.1</strong>
-              </label>
-
-              <label class="range-field">
-                <span>조모임</span>
-                <input id="teamworkWeight" type="range" min="0" max="5" step="0.1" value="0.8">
-                <strong data-output-for="teamworkWeight">0.8</strong>
-              </label>
-
-              <label class="range-field">
-                <span>성적</span>
-                <input id="gradingWeight" type="range" min="0" max="5" step="0.1" value="0.9">
-                <strong data-output-for="gradingWeight">0.9</strong>
-              </label>
+              <div class="weight-grid">
+                <label class="range-field">
+                  <span>평점</span>
+                  <input id="ratingWeight" type="range" min="0" max="5" step="0.1" value="1">
+                  <strong data-output-for="ratingWeight">1</strong>
+                </label>
+                <label class="range-field">
+                  <span>과제</span>
+                  <input id="workloadWeight" type="range" min="0" max="5" step="0.1" value="1.1">
+                  <strong data-output-for="workloadWeight">1.1</strong>
+                </label>
+                <label class="range-field">
+                  <span>조모임</span>
+                  <input id="teamworkWeight" type="range" min="0" max="5" step="0.1" value="0.8">
+                  <strong data-output-for="teamworkWeight">0.8</strong>
+                </label>
+                <label class="range-field">
+                  <span>성적</span>
+                  <input id="gradingWeight" type="range" min="0" max="5" step="0.1" value="0.9">
+                  <strong data-output-for="gradingWeight">0.9</strong>
+                </label>
+              </div>
             </div>
           </div>
         </form>
-      </section>
+      </aside>
 
-      <div id="resultsArea" class="results-area" hidden>
+      <div id="resultsArea" class="results-area">
         <section class="workspace" aria-live="polite">
           <div class="workspace-header">
             <div>
@@ -165,12 +154,16 @@
             </div>
             <div class="metric-row">
               <div>
-                <span>과목</span>
-                <strong id="courseCount">-</strong>
+                <span>학점</span>
+                <strong id="selectedCredits">-</strong>
               </div>
               <div>
-                <span>데이터</span>
-                <strong id="dataSource">-</strong>
+                <span>전공필수</span>
+                <strong id="selectedCoreCount">-</strong>
+              </div>
+              <div>
+                <span>점수</span>
+                <strong id="selectedScore">-</strong>
               </div>
             </div>
           </div>
@@ -184,6 +177,11 @@
             <span>상세</span>
           </div>
           <div id="summary" class="summary-list"></div>
+
+          <div class="section-title compact">
+            <span>진단</span>
+          </div>
+          <div id="diagnostics" class="diagnostic-list"></div>
 
           <div class="section-title compact">
             <span>조건 데이터</span>

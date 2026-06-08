@@ -2,21 +2,19 @@
 
 조건 기반 시간표 추천 MVP입니다. 학교 포털 과목 목록과 에브리타임 평가 지표를 담은 `courses.csv`를 사용해, UI에서 받은 조건에 맞는 시간표를 추천합니다.
 
-현재 저장소에는 팀 개발을 위한 mock 과목 데이터와 schema-only 리뷰 CSV가 포함되어 있습니다.
+애플리케이션 레이어는 `data/csv/courses.csv`만 읽습니다. 리뷰 라벨링과 모델 실험 스크립트는 팀원이 오프라인으로 실행해 `courses.csv`의 course-level 평가 컬럼을 준비하는 용도입니다.
 
 - `data/csv/courses.csv`: 과목 목록과 에브리타임 course-level 평가 컬럼
-- `data/csv/raw_everytime_reviews.csv`: 원본 리뷰 CSV 헤더
-- `data/csv/labeled_everytime_reviews.csv`: 라벨 리뷰 CSV 헤더
 
 ## 구조
 
 - `app/main.py`: FastAPI 서버, 정적 UI 서빙, 추천 API
 - `app/static/`: 순수 HTML/CSS/JS UI
 - `scripts/recommend.py`: 시간표 조합 생성 및 점수 계산
-- `scripts/extract_everytime_saved_html.py`: Everytime 저장 HTML/MHTML 리뷰 추출
-- `scripts/label_everytime_reviews.py`: 리뷰 약지도 라벨링
-- `scripts/train_difficulty_model.py`: TF-IDF 기반 리뷰 라벨 모델 실험
-- `docs/data_contract.md`: raw review, labeled review, course catalog CSV 계약
+- `scripts/extract_everytime_saved_html.py`: 오프라인 Everytime 저장 HTML/MHTML 리뷰 추출
+- `scripts/label_everytime_reviews.py`: 오프라인 리뷰 약지도 라벨링
+- `scripts/train_difficulty_model.py`: 오프라인 TF-IDF 기반 리뷰 라벨 모델 실험
+- `docs/data_contract.md`: course catalog CSV 계약과 오프라인 리뷰 CSV 계약
 
 ## 실행
 
@@ -37,31 +35,20 @@ python3 -m uvicorn app.main:app --reload
 ## 데이터 흐름
 
 ```text
-data/csv/raw_everytime_reviews.csv
--> 리뷰 라벨링
--> data/csv/labeled_everytime_reviews.csv
--> 에브리타임 course-level 평가 수집
--> data/csv/courses.csv
+data/csv/courses.csv
 -> UI 조건 기반 시간표 추천
 ```
 
-관리자 패널의 `리뷰 해석 및 동기화` 버튼은 `data/csv/raw_everytime_reviews.csv`를 입력으로 `scripts/label_everytime_reviews.py`를 실행하고, 결과를 `data/csv/labeled_everytime_reviews.csv`에 병합합니다.
-
-기존 labeled CSV에만 있는 리뷰는 삭제하지 않습니다. 같은 `review_id`가 있으면 갱신하고, 새 리뷰는 뒤에 추가합니다.
-
-추천 점수는 labeled review 집계값이 아니라 `courses.csv`의 `rating`, `workload_label`, `teamwork_load_label`, `grading_strictness_label`을 사용합니다.
+추천 점수는 `courses.csv`의 `rating`, `workload_label`, `teamwork_load_label`, `grading_strictness_label`을 사용합니다. 전공필수는 가중치가 아니라 최소/최대 개수 조건으로 처리합니다.
 
 ## CSV 계약
 
-기본 서버는 `data/csv/courses.csv`, `data/csv/raw_everytime_reviews.csv`, `data/csv/labeled_everytime_reviews.csv`를 사용합니다. 세부 컬럼 계약은 [docs/data_contract.md](docs/data_contract.md)를 기준으로 합니다.
+기본 서버는 `data/csv/courses.csv`를 사용합니다. 세부 컬럼 계약은 [docs/data_contract.md](docs/data_contract.md)를 기준으로 합니다.
 
 다른 파일을 쓰려면 서버 실행 전에 환경변수를 지정합니다.
 
 ```bash
-OPTILIFE_COURSES_CSV=/path/to/courses.csv \
-OPTILIFE_RAW_REVIEWS_CSV=/path/to/raw_everytime_reviews.csv \
-OPTILIFE_LABELED_REVIEWS_CSV=/path/to/labeled_everytime_reviews.csv \
-python3 -m uvicorn app.main:app --reload
+OPTILIFE_COURSES_CSV=/path/to/courses.csv python3 -m uvicorn app.main:app --reload
 ```
 
 과목 CSV의 추천 필수 컬럼은 아래와 같습니다.
@@ -77,9 +64,7 @@ course_name,credits,core,rating,workload_label,teamwork_load_label,grading_stric
 
 - `GET /api/health`: 앱 상태, CSV 경로, row count, course-level 평가 컬럼 준비 여부
 - `GET /api/courses`: 과목 목록과 에브리타임 평가 지표
-- `POST /api/recommend`: UI 조건을 기반으로 시간표 추천
-- `GET /api/admin/datasets`: 관리자 데이터 상태
-- `POST /api/admin/sync-reviews`: raw review CSV를 라벨링해서 labeled review CSV에 병합
+- `POST /api/recommend`: UI 조건을 기반으로 시간표 추천과 실패 진단 반환
 
 ## CLI 사용
 
@@ -91,7 +76,7 @@ python3 scripts/recommend.py \
   --output outputs/recommendations.txt
 ```
 
-리뷰 라벨링만 실행하려면 아래 명령을 사용합니다.
+오프라인 리뷰 라벨링은 앱 서버와 분리해서 실행합니다.
 
 ```bash
 python3 scripts/label_everytime_reviews.py \
@@ -116,5 +101,5 @@ python3 -m pytest
 curl -s http://127.0.0.1:8000/api/health
 curl -s -X POST http://127.0.0.1:8000/api/recommend \
   -H 'Content-Type: application/json' \
-  -d '{"min_credits":15,"max_credits":18,"limit":3}'
+  -d '{"min_credits":15,"max_credits":18,"core_min_count":2,"core_max_count":4,"categories":["전공코어","전공심화","교양"],"limit":3}'
 ```

@@ -1,8 +1,6 @@
 import csv
 import math
 import os
-import subprocess
-import sys
 from pathlib import Path
 from typing import Any, Dict, List
 
@@ -13,27 +11,23 @@ from pydantic import BaseModel, Field
 
 from scripts.recommend import (
     DAY_LABELS,
+    build_recommendation_diagnostics,
     daily_burden,
     find_recommendations,
     format_minutes,
     load_courses,
     normalize_day,
     parse_slots,
+    preference_warnings,
 )
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STATIC_DIR = PROJECT_ROOT / "app" / "static"
 CANONICAL_COURSES_PATH = PROJECT_ROOT / "data" / "csv" / "courses.csv"
-CANONICAL_RAW_REVIEWS_PATH = PROJECT_ROOT / "data" / "csv" / "raw_everytime_reviews.csv"
-CANONICAL_LABELED_REVIEWS_PATH = (
-    PROJECT_ROOT / "data" / "csv" / "labeled_everytime_reviews.csv"
-)
-LABELING_SUMMARY_PATH = PROJECT_ROOT / "outputs" / "review_labeling_summary.txt"
 SAMPLE_COURSES_PATH = (
     PROJECT_ROOT / "scripts" / "examples" / "recommend" / "input" / "courses.csv"
 )
-LABELING_SCRIPT_PATH = PROJECT_ROOT / "scripts" / "label_everytime_reviews.py"
 COURSE_EVALUATION_COLUMNS = [
     "rating",
     "workload_label",
@@ -61,12 +55,14 @@ class ConditionData(BaseModel):
     min_credits: int = Field(15, ge=1, le=30)
     max_credits: int = Field(18, ge=1, le=30)
     limit: int = Field(3, ge=1, le=10)
+    core_min_count: int = Field(0, ge=0, le=30)
+    core_max_count: int = Field(30, ge=0, le=30)
+    categories: List[str] = Field(default_factory=list)
     preferred_free_days: List[str] = Field(default_factory=lambda: ["Fri"])
     avoid_early: bool = True
     avoid_friday_afternoon: bool = True
     balance_days: bool = True
     early_cutoff: str = "10:00"
-    core_weight: float = Field(8.0, ge=0, le=20)
     rating_weight: float = Field(1.0, ge=0, le=5)
     workload_weight: float = Field(1.1, ge=0, le=5)
     teamwork_weight: float = Field(0.8, ge=0, le=5)
@@ -95,20 +91,6 @@ def resolve_course_path() -> Path:
         return CANONICAL_COURSES_PATH
 
     return SAMPLE_COURSES_PATH
-
-
-def resolve_raw_review_path() -> Path:
-    configured = os.environ.get("OPTILIFE_RAW_REVIEWS_CSV")
-    if configured:
-        return Path(configured).expanduser()
-    return CANONICAL_RAW_REVIEWS_PATH
-
-
-def resolve_labeled_review_path() -> Path:
-    configured = os.environ.get("OPTILIFE_LABELED_REVIEWS_CSV")
-    if configured:
-        return Path(configured).expanduser()
-    return CANONICAL_LABELED_REVIEWS_PATH
 
 
 def csv_info(path: Path) -> Dict[str, Any]:
@@ -187,6 +169,8 @@ def clean_api_string(value: Any) -> str:
 def serialize_course(course: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "course_id": clean_api_string(course.get("course_id", "")),
+        "academic_year": clean_api_string(course.get("academic_year", "")),
+        "semester": clean_api_string(course.get("semester", "")),
         "course_name": clean_api_string(course["course_name"]),
         "department": clean_api_string(course.get("department", "")),
         "section": clean_api_string(course.get("section", "")),
@@ -201,6 +185,8 @@ def serialize_course(course: Dict[str, Any]) -> Dict[str, Any]:
         "time_slot": clean_api_string(course["time_slot"]),
         "campus": clean_api_string(course.get("campus", "")),
         "classroom": clean_api_string(course.get("classroom", "")),
+        "capacity": clean_api_string(course.get("capacity", "")),
+        "source": clean_api_string(course.get("source", "")),
     }
 
 
@@ -216,6 +202,9 @@ def serialize_blocks(course: Dict[str, Any]) -> List[Dict[str, Any]]:
                 "start_minutes": start,
                 "end_minutes": end,
                 "course_name": course["course_name"],
+                "professor": course.get("professor", ""),
+                "category": course.get("category", ""),
+                "section": course.get("section", ""),
                 "credits": course["credits"],
                 "core": course["core"],
                 "workload_label": course["workload_label"],
@@ -231,6 +220,7 @@ def serialize_recommendation(
     score: float,
     schedule: List[Dict[str, Any]],
     reasons: List[str],
+    preferences: Dict[str, Any],
 ) -> Dict[str, Any]:
     courses = [serialize_course(course) for course in schedule]
     blocks = [
@@ -239,10 +229,16 @@ def serialize_recommendation(
         for block in serialize_blocks(course)
     ]
     burden = daily_burden(courses)
+    category_counts: Dict[str, int] = {}
+    for course in courses:
+        category = course["category"] or "미분류"
+        category_counts[category] = category_counts.get(category, 0) + 1
     return {
         "rank": rank,
         "score": round(float(score), 2),
         "credits": sum(course["credits"] for course in courses),
+        "core_count": sum(1 for course in courses if course["core"]),
+        "category_counts": category_counts,
         "rating_sum": round(sum(course["rating"] for course in courses), 2),
         "workload_sum": round(sum(course["workload_label"] for course in courses), 2),
         "teamwork_sum": round(
@@ -254,6 +250,7 @@ def serialize_recommendation(
             2,
         ),
         "reasons": reasons,
+        "unmet_preferences": preference_warnings(courses, preferences=preferences),
         "courses": courses,
         "blocks": blocks,
         "daily_burden": {
@@ -267,7 +264,15 @@ def condition_to_preferences(condition: Dict[str, Any]) -> Dict[str, Any]:
     preferences = {
         key: value
         for key, value in condition.items()
-        if key not in {"min_credits", "max_credits", "limit"}
+        if key
+        not in {
+            "min_credits",
+            "max_credits",
+            "limit",
+            "core_min_count",
+            "core_max_count",
+            "categories",
+        }
     }
     preferences["preferred_free_days"] = [
         normalize_day(day) or day
@@ -278,14 +283,16 @@ def condition_to_preferences(condition: Dict[str, Any]) -> Dict[str, Any]:
 
 def build_dataset_status() -> Dict[str, Any]:
     path, courses = load_course_records()
-    raw_path = resolve_raw_review_path()
-    labeled_path = resolve_labeled_review_path()
     missing_evaluation = courses_missing_evaluation(path)
+    category_counts: Dict[str, int] = {}
+    for course in courses:
+        category = course["category"] or "미분류"
+        category_counts[category] = category_counts.get(category, 0) + 1
     return {
         "courses": csv_info(path),
-        "raw_reviews": csv_info(raw_path),
-        "labeled_reviews": csv_info(labeled_path),
         "course_count": len(courses),
+        "core_course_count": sum(1 for course in courses if course["core"]),
+        "categories": category_counts,
         "course_evaluation_columns": COURSE_EVALUATION_COLUMNS,
         "courses_missing_evaluation": missing_evaluation,
         "ready": bool(courses) and not missing_evaluation,
@@ -346,14 +353,10 @@ def health() -> Dict[str, Any]:
         "ok": True,
         "course_count": len(courses),
         "data_source": display_path(path),
-        "review_data_source": display_path(resolve_labeled_review_path()),
         "data_status": "sample" if using_sample else "ready",
         "dataset": dataset,
         "flow": [
-            "raw_everytime_reviews",
-            "ai_labeling",
-            "labeled_review_csv",
-            "course_everytime_metrics",
+            "courses_csv",
             "condition_ui",
             "schedule_recommendation",
         ],
@@ -365,61 +368,7 @@ def courses() -> Dict[str, Any]:
     path, records = load_course_records()
     return {
         "data_source": display_path(path),
-        "review_data_source": display_path(resolve_labeled_review_path()),
         "courses": records,
-    }
-
-
-@app.get("/api/admin/datasets")
-def admin_datasets() -> Dict[str, Any]:
-    return build_dataset_status()
-
-
-@app.post("/api/admin/sync-reviews")
-def sync_reviews() -> Dict[str, Any]:
-    raw_path = resolve_raw_review_path()
-    labeled_path = resolve_labeled_review_path()
-    if not raw_path.exists():
-        raise HTTPException(
-            status_code=400,
-            detail=f"Raw review CSV not found: {display_path(raw_path)}",
-        )
-
-    LABELING_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
-    command = [
-        sys.executable,
-        str(LABELING_SCRIPT_PATH),
-        "--input",
-        str(raw_path),
-        "--output",
-        str(labeled_path),
-        "--summary",
-        str(LABELING_SUMMARY_PATH),
-        "--merge-existing",
-    ]
-    result = subprocess.run(
-        command,
-        cwd=PROJECT_ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise HTTPException(
-            status_code=500,
-            detail={
-                "message": "Review labeling script failed.",
-                "stdout": result.stdout,
-                "stderr": result.stderr,
-            },
-        )
-
-    return {
-        "ok": True,
-        "message": "리뷰 동기화 완료",
-        "stdout": result.stdout.strip(),
-        "summary_path": display_path(LABELING_SUMMARY_PATH),
-        "dataset": build_dataset_status(),
     }
 
 
@@ -431,6 +380,11 @@ def recommend(condition_data: ConditionData) -> Dict[str, Any]:
             status_code=400,
             detail="min_credits must be less than or equal to max_credits.",
         )
+    if condition["core_min_count"] > condition["core_max_count"]:
+        raise HTTPException(
+            status_code=400,
+            detail="core_min_count must be less than or equal to core_max_count.",
+        )
 
     path, courses = load_course_records()
     preferences = condition_to_preferences(condition)
@@ -440,15 +394,27 @@ def recommend(condition_data: ConditionData) -> Dict[str, Any]:
         max_credits=condition["max_credits"],
         limit=condition["limit"],
         preferences=preferences,
+        core_min_count=condition["core_min_count"],
+        core_max_count=condition["core_max_count"],
+        categories=condition["categories"],
+    )
+    diagnostics = build_recommendation_diagnostics(
+        courses,
+        min_credits=condition["min_credits"],
+        max_credits=condition["max_credits"],
+        recommendations=recommendations,
+        core_min_count=condition["core_min_count"],
+        core_max_count=condition["core_max_count"],
+        categories=condition["categories"],
     )
 
     return {
         "condition_data": condition,
         "data_source": display_path(path),
-        "review_data_source": display_path(resolve_labeled_review_path()),
         "course_count": len(courses),
+        "diagnostics": diagnostics,
         "recommendations": [
-            serialize_recommendation(rank, score, list(schedule), reasons)
+            serialize_recommendation(rank, score, list(schedule), reasons, preferences)
             for rank, (score, schedule, reasons) in enumerate(
                 recommendations,
                 start=1,

@@ -1,6 +1,6 @@
 # Data Contract
 
-OptiLife uses three CSV datasets under `data/csv/`.
+OptiLife app/API uses `courses.csv` under `data/csv/`. The review CSV contracts below are for offline scripts that prepare course-level values before they are copied into `courses.csv`.
 
 ## `courses.csv`
 

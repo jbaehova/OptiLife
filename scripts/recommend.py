@@ -1,8 +1,8 @@
 import argparse
-import itertools
 import math
 import os
 import re
+from collections import defaultdict
 
 import pandas as pd
 
@@ -73,7 +73,6 @@ DEFAULT_PREFERENCES = {
     "avoid_friday_afternoon": True,
     "balance_days": True,
     "early_cutoff": "10:00",
-    "core_weight": 8.0,
     "credit_weight": 1.5,
     "rating_weight": 1.0,
     "workload_weight": 1.1,
@@ -86,6 +85,8 @@ DEFAULT_PREFERENCES = {
     "daily_burden_limit": 9.0,
     "daily_burden_penalty": 1.5,
 }
+
+DEFAULT_BEAM_PER_BUCKET = 25
 
 
 def parse_bool(value):
@@ -103,6 +104,14 @@ def parse_float(value, default):
 
 def normalize_day(value):
     return DAY_ALIASES.get(str(value).strip())
+
+
+def normalize_categories(categories=None):
+    if not categories:
+        return []
+    if isinstance(categories, str):
+        categories = categories.split(",")
+    return [clean_string(category) for category in categories if clean_string(category)]
 
 
 def clean_string(value):
@@ -150,7 +159,6 @@ def normalize_preferences(preferences=None):
         normalized[key] = parse_bool(normalized[key])
 
     for key in [
-        "core_weight",
         "credit_weight",
         "rating_weight",
         "workload_weight",
@@ -214,6 +222,61 @@ def to_course_records(courses):
     return list(courses)
 
 
+def filter_courses(courses, categories=None):
+    records = to_course_records(courses)
+    normalized_categories = set(normalize_categories(categories))
+    if not normalized_categories:
+        return records
+    return [
+        course
+        for course in records
+        if clean_string(course.get("category", "")) in normalized_categories
+    ]
+
+
+def course_group_key(course):
+    course_id = clean_string(course.get("course_id", ""))
+    if course_id:
+        return course_id
+    return "|".join(
+        [
+            clean_string(course.get("department", "")),
+            clean_string(course.get("course_name", "")),
+            clean_string(course.get("category", "")),
+        ]
+    )
+
+
+def group_course_sections(courses):
+    grouped = defaultdict(list)
+    for course in courses:
+        grouped[course_group_key(course)].append(course)
+
+    groups = list(grouped.values())
+    for group in groups:
+        group.sort(key=course_section_rank, reverse=True)
+
+    groups.sort(
+        key=lambda group: (
+            not any(course["core"] for course in group),
+            -max(course["credits"] for course in group),
+            clean_string(group[0].get("course_name", "")),
+            clean_string(group[0].get("section", "")),
+        )
+    )
+    return groups
+
+
+def course_section_rank(course):
+    return (
+        float(course.get("rating", DEFAULT_RATING)),
+        float(course.get("workload_label", DEFAULT_SCORE)),
+        float(course.get("teamwork_load_label", DEFAULT_SCORE)),
+        float(course.get("grading_strictness_label", DEFAULT_SCORE)),
+        -len(parse_slots(course.get("time_slot", ""))),
+    )
+
+
 def to_minutes(hour, minute):
     return int(hour) * 60 + int(minute)
 
@@ -252,6 +315,14 @@ def has_conflict(schedule):
     return False
 
 
+def slots_conflict(candidate_slots, occupied_slots):
+    for slot in candidate_slots:
+        for occupied_slot in occupied_slots:
+            if overlaps(slot, occupied_slot):
+                return True
+    return False
+
+
 def daily_burden(schedule):
     burden_by_day = {}
     for course in schedule:
@@ -269,6 +340,91 @@ def course_burden(course):
 
 def format_day(day):
     return DAY_LABELS.get(day, day)
+
+
+def diagnostic_item(code, label, expected, actual, help_text):
+    return {
+        "code": code,
+        "label": label,
+        "expected": expected,
+        "actual": actual,
+        "help": help_text,
+    }
+
+
+def preference_warnings(schedule, preferences=None):
+    preferences = normalize_preferences(preferences)
+    all_slots = [
+        slot
+        for course in schedule
+        for slot in parse_slots(course["time_slot"])
+    ]
+    warnings = []
+
+    if preferences["avoid_early"]:
+        early_slots = [
+            slot for slot in all_slots if slot[1] < preferences["early_cutoff_minutes"]
+        ]
+        if early_slots:
+            warnings.append(
+                diagnostic_item(
+                    "AVOID_EARLY_UNMET",
+                    "이른 수업 회피",
+                    f"{format_minutes(preferences['early_cutoff_minutes'])} 이전 수업 없음",
+                    f"{len(early_slots)}개 수업이 기준보다 빠름",
+                    "이른 수업 회피를 끄거나 기준 시간을 앞당기면 더 많은 시간표를 비교할 수 있습니다.",
+                )
+            )
+
+    if preferences["avoid_friday_afternoon"]:
+        friday_afternoon_slots = [
+            slot for slot in all_slots if slot[0] == "Fri" and slot[1] >= 12 * 60
+        ]
+        if friday_afternoon_slots:
+            warnings.append(
+                diagnostic_item(
+                    "FRIDAY_AFTERNOON_UNMET",
+                    "금요일 오후 회피",
+                    "금요일 12:00 이후 수업 없음",
+                    f"{len(friday_afternoon_slots)}개 금요일 오후 수업 포함",
+                    "금요일 오후 회피를 끄거나 금요일 공강 선호를 함께 낮추면 후보가 늘어납니다.",
+                )
+            )
+
+    for day in preferences["preferred_free_days"]:
+        day_slots = [slot for slot in all_slots if slot[0] == day]
+        if day_slots:
+            warnings.append(
+                diagnostic_item(
+                    "PREFERRED_FREE_DAY_UNMET",
+                    f"{format_day(day)} 공강 선호",
+                    f"{format_day(day)} 수업 없음",
+                    f"{len(day_slots)}개 수업 포함",
+                    "해당 요일 공강 선호를 해제하거나 다른 공강 요일을 선택하면 더 현실적인 후보가 나옵니다.",
+                )
+            )
+
+    if preferences["balance_days"]:
+        heavy_days = [
+            (day, burden)
+            for day, burden in daily_burden(schedule).items()
+            if burden > preferences["daily_burden_limit"]
+        ]
+        if heavy_days:
+            day_text = ", ".join(
+                f"{format_day(day)} {burden:.1f}" for day, burden in heavy_days
+            )
+            warnings.append(
+                diagnostic_item(
+                    "DAILY_BALANCE_UNMET",
+                    "요일 부담 분산",
+                    f"요일별 부담 {preferences['daily_burden_limit']:.1f} 이하",
+                    day_text,
+                    "요일 부담 분산 선호를 끄거나 학점 범위를 낮추면 특정 요일 집중을 줄일 수 있습니다.",
+                )
+            )
+
+    return warnings
 
 
 def score_schedule(schedule, preferences=None):
@@ -292,7 +448,6 @@ def score_schedule(schedule, preferences=None):
     friday_afternoon_slots = [slot for slot in friday_slots if slot[1] >= 12 * 60]
 
     score = 100.0
-    score += core_count * preferences["core_weight"]
     score += credits * preferences["credit_weight"]
     score += total_rating * preferences["rating_weight"]
     score += total_workload * preferences["workload_weight"]
@@ -344,29 +499,236 @@ def score_schedule(schedule, preferences=None):
     return score, reasons
 
 
-def find_recommendations(courses, min_credits, max_credits, limit, preferences=None):
-    course_records = to_course_records(courses)
+def make_search_state(schedule, occupied_slots, credits, core_count, preferences):
+    rank_score = 0 if not schedule else score_schedule(schedule, preferences)[0]
+    return (rank_score, schedule, occupied_slots, credits, core_count)
+
+
+def prune_search_states(states, beam_per_bucket):
+    buckets = defaultdict(list)
+    for state in states:
+        _, _, _, credits, core_count = state
+        buckets[(credits, core_count)].append(state)
+
+    pruned = []
+    for bucket in buckets.values():
+        bucket.sort(key=lambda state: state[0], reverse=True)
+        pruned.extend(bucket[:beam_per_bucket])
+    return pruned
+
+
+def find_recommendations(
+    courses,
+    min_credits,
+    max_credits,
+    limit,
+    preferences=None,
+    core_min_count=0,
+    core_max_count=None,
+    categories=None,
+    beam_per_bucket=DEFAULT_BEAM_PER_BUCKET,
+):
+    course_records = filter_courses(courses, categories=categories)
     if not course_records:
         return []
 
-    min_course_credits = min(course["credits"] for course in course_records)
-    max_course_credits = max(course["credits"] for course in course_records)
-    min_count = max(1, math.ceil(min_credits / max_course_credits))
-    max_count = min(len(course_records), math.floor(max_credits / min_course_credits))
+    groups = group_course_sections(course_records)
+    if core_max_count is None:
+        core_max_count = len(groups)
+
+    preferences = normalize_preferences(preferences)
+    states = [make_search_state(tuple(), tuple(), 0, 0, preferences)]
+
+    for group in groups:
+        next_states = list(states)
+        for _, schedule, occupied_slots, credits, core_count in states:
+            for course in group:
+                next_credits = credits + course["credits"]
+                next_core_count = core_count + (1 if course["core"] else 0)
+                if next_credits > max_credits or next_core_count > core_max_count:
+                    continue
+
+                course_slots = tuple(parse_slots(course["time_slot"]))
+                if slots_conflict(course_slots, occupied_slots):
+                    continue
+
+                next_schedule = schedule + (course,)
+                next_occupied_slots = occupied_slots + course_slots
+                next_states.append(
+                    make_search_state(
+                        next_schedule,
+                        next_occupied_slots,
+                        next_credits,
+                        next_core_count,
+                        preferences,
+                    )
+                )
+
+        states = prune_search_states(next_states, beam_per_bucket)
 
     candidates = []
-    for count in range(min_count, max_count + 1):
-        for schedule in itertools.combinations(course_records, count):
-            credits = sum(course["credits"] for course in schedule)
-            if credits < min_credits or credits > max_credits:
-                continue
-            if has_conflict(schedule):
-                continue
-            score, reasons = score_schedule(schedule, preferences=preferences)
-            candidates.append((score, schedule, reasons))
+    seen = set()
+    for _, schedule, _, credits, core_count in states:
+        if credits < min_credits or credits > max_credits:
+            continue
+        if core_count < core_min_count or core_count > core_max_count:
+            continue
+
+        signature = tuple(
+            sorted(
+                (
+                    clean_string(course.get("course_id", "")),
+                    clean_string(course.get("section", "")),
+                    clean_string(course.get("course_name", "")),
+                )
+                for course in schedule
+            )
+        )
+        if signature in seen:
+            continue
+        seen.add(signature)
+
+        score, reasons = score_schedule(schedule, preferences=preferences)
+        candidates.append((score, schedule, reasons))
 
     candidates.sort(key=lambda item: item[0], reverse=True)
     return candidates[:limit]
+
+
+def max_credits_with_core_limit(groups, core_max_count):
+    non_core_credits = []
+    core_credits = []
+    for group in groups:
+        credits = max(course["credits"] for course in group)
+        if any(course["core"] for course in group):
+            core_credits.append(credits)
+        else:
+            non_core_credits.append(credits)
+    return sum(non_core_credits) + sum(sorted(core_credits, reverse=True)[:core_max_count])
+
+
+def min_credits_for_core_count(groups, core_min_count):
+    if core_min_count <= 0:
+        return 0
+    core_credits = sorted(
+        min(course["credits"] for course in group)
+        for group in groups
+        if any(course["core"] for course in group)
+    )
+    if len(core_credits) < core_min_count:
+        return math.inf
+    return sum(core_credits[:core_min_count])
+
+
+def build_recommendation_diagnostics(
+    courses,
+    min_credits,
+    max_credits,
+    recommendations,
+    core_min_count=0,
+    core_max_count=None,
+    categories=None,
+):
+    course_records = filter_courses(courses, categories=categories)
+    selected_categories = normalize_categories(categories)
+    blocking = []
+
+    if not course_records:
+        blocking.append(
+            diagnostic_item(
+                "NO_CATEGORY_MATCH",
+                "카테고리 필터",
+                ", ".join(selected_categories) if selected_categories else "전체",
+                "후보 과목 0개",
+                "카테고리 선택을 넓히거나 courses.csv에 해당 카테고리 과목이 있는지 확인하세요.",
+            )
+        )
+        return {
+            "status": "no_schedule",
+            "blocking": blocking,
+            "warnings": [],
+        }
+
+    groups = group_course_sections(course_records)
+    if core_max_count is None:
+        core_max_count = len(groups)
+
+    min_course_credits = min(course["credits"] for course in course_records)
+    max_reachable_credits = max_credits_with_core_limit(groups, core_max_count)
+    max_core_possible = sum(1 for group in groups if any(course["core"] for course in group))
+    core_min_credit_floor = min_credits_for_core_count(groups, core_min_count)
+
+    if max_credits < min_course_credits:
+        blocking.append(
+            diagnostic_item(
+                "MAX_CREDITS_TOO_LOW",
+                "최대 학점",
+                f"최소 {min_course_credits}학점 이상",
+                f"현재 최대 {max_credits}학점",
+                "최대 학점을 가장 작은 과목 학점 이상으로 올려야 시간표를 만들 수 있습니다.",
+            )
+        )
+
+    if min_credits > max_reachable_credits:
+        blocking.append(
+            diagnostic_item(
+                "MIN_CREDITS_TOO_HIGH",
+                "최소 학점",
+                f"최대 {max_reachable_credits}학점 이하",
+                f"현재 최소 {min_credits}학점",
+                "최소 학점을 낮추거나 카테고리 필터와 전공필수 최대 개수를 완화하세요.",
+            )
+        )
+
+    if core_min_count > max_core_possible:
+        blocking.append(
+            diagnostic_item(
+                "CORE_MIN_TOO_HIGH",
+                "전공필수 최소 개수",
+                f"최대 {max_core_possible}개 이하",
+                f"현재 최소 {core_min_count}개",
+                "전공필수 최소 개수를 낮추거나 전공코어 카테고리를 포함하세요.",
+            )
+        )
+
+    if core_min_credit_floor > max_credits:
+        blocking.append(
+            diagnostic_item(
+                "MAX_CREDITS_TOO_LOW",
+                "최대 학점",
+                f"전공필수 {core_min_count}개를 담으려면 최소 {core_min_credit_floor}학점",
+                f"현재 최대 {max_credits}학점",
+                "최대 학점을 올리거나 전공필수 최소 개수를 낮추세요.",
+            )
+        )
+
+    if max_reachable_credits < min_credits and core_max_count < max_core_possible:
+        blocking.append(
+            diagnostic_item(
+                "CORE_MAX_TOO_LOW",
+                "전공필수 최대 개수",
+                f"최소 {min_credits}학점 도달 가능",
+                f"전공필수 최대 {core_max_count}개 기준 {max_reachable_credits}학점",
+                "전공필수 최대 개수를 올리거나 최소 학점을 낮추세요.",
+            )
+        )
+
+    if not recommendations and not blocking:
+        blocking.append(
+            diagnostic_item(
+                "TIME_CONFLICT_BOTTLENECK",
+                "시간 충돌",
+                "학점과 전공필수 조건을 동시에 만족하는 비충돌 조합",
+                "후보 없음",
+                "학점 범위를 낮추거나 카테고리 필터를 넓히고, 특정 과목군의 분반 시간이 겹치는지 확인하세요.",
+            )
+        )
+
+    return {
+        "status": "ok" if recommendations else "no_schedule",
+        "blocking": [] if recommendations else blocking,
+        "warnings": [],
+    }
 
 
 def format_minutes(minutes):
