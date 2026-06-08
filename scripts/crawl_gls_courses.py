@@ -6,24 +6,11 @@ data/csv/courses.csv 형식으로 저장합니다.
 최초 1회 브라우저 설치 필요:
     python -m playwright install chromium
 
-환경변수 설정:
-    Windows PowerShell:
-        $env:GLS_USER_ID="학번"
-        $env:GLS_PASSWORD="비밀번호"
-
-    macOS / Linux:
-        export GLS_USER_ID="학번"
-        export GLS_PASSWORD="비밀번호"
-
-    또는 프로젝트 루트의 .env 파일 (.gitignore에 등록됨):
-        GLS_USER_ID=학번
-        GLS_PASSWORD=비밀번호
-
 실행:
-    python scripts/crawl_gls_courses.py --year 2026 --semester 1
+    python scripts/crawl_gls_courses.py --year 2026 --semester 1 --user-id 학번 --password 비밀번호
 
 브라우저 창을 직접 보면서 실행하려면:
-    python scripts/crawl_gls_courses.py --year 2026 --semester 1 --headed
+    python scripts/crawl_gls_courses.py --year 2026 --semester 1 --user-id 학번 --password 비밀번호 --headed
 """
 
 import argparse
@@ -52,8 +39,6 @@ COURSE_API_PATHS = {
 SEMESTER_CODE = {1: "10", 2: "20"}
 
 SOURCE        = "gls"
-ENV_USER_ID   = "GLS_USER_ID"
-ENV_PASSWORD  = "GLS_PASSWORD"
 
 # 페이지 로드 최대 대기 시간 (ms)
 TIMEOUT_MS = 60_000
@@ -486,20 +471,16 @@ def main() -> None:
                              "(예: outputs/debug/raw_ssv_01.txt,outputs/debug/raw_ssv_02.txt)")
     args = parser.parse_args()
 
-    user_id  = os.environ.get(ENV_USER_ID)  or args.user_id
-    password = os.environ.get(ENV_PASSWORD) or args.password
+    user_id  = args.user_id
+    password = args.password
 
     if not user_id or not password:
         print(
-            f"오류: 로그인 정보가 없습니다.\n"
-            f"환경변수를 설정하거나 CLI 인자를 사용하세요.\n"
-            f"  $env:{ENV_USER_ID}='학번'\n"
-            f"  $env:{ENV_PASSWORD}='비밀번호'"
+            "오류: 로그인 정보가 없습니다.\n"
+            "CLI 인자로 학번과 비밀번호를 입력하세요.\n"
+            "  --user-id 학번 --password 비밀번호"
         )
         sys.exit(1)
-
-    if os.environ.get(ENV_USER_ID):
-        print(f"환경변수 {ENV_USER_ID} 에서 학번을 읽었습니다.")
 
     # 저장된 SSV 파일이 있으면 브라우저 없이 바로 파싱
     if args.from_ssv:
