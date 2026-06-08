@@ -456,9 +456,9 @@ def main() -> None:
     parser.add_argument("--semester", type=int, required=True, choices=[1, 2],
                         help="개설 학기 (1 또는 2)")
     parser.add_argument("--user-id",  default="",
-                        help=f"로그인 학번. 환경변수 {ENV_USER_ID} 가 우선 적용됩니다.")
+                        help="로그인 학번")
     parser.add_argument("--password", default="",
-                        help=f"로그인 비밀번호. 환경변수 {ENV_PASSWORD} 가 우선 적용됩니다.")
+                        help="로그인 비밀번호")
     parser.add_argument("--output",   default="data/csv/courses.csv",
                         help="저장할 CSV 경로 (기본값: data/csv/courses.csv)")
     parser.add_argument("--overwrite", action="store_true",
