@@ -68,6 +68,12 @@ FIELDNAMES = [
     "category", "time_slot", "campus", "classroom", "capacity", "source",
 ]
 
+EVALUATION_COLUMNS = [
+    "rating", "workload_label", "teamwork_load_label", "grading_strictness_label",
+]
+
+ALL_FIELDNAMES = FIELDNAMES + EVALUATION_COLUMNS
+
 CORE_KEYWORDS = {"전공필수", "교양필수", "전공코어"}
 
 # ---------------------------------------------------------------------------
@@ -392,13 +398,63 @@ def fetch_ssv_with_playwright(
     return ssv_results
 
 # ---------------------------------------------------------------------------
-# --- CSV 저장 ---
+# --- CSV 저장 / 병합 ---
 # ---------------------------------------------------------------------------
+
+def _course_key(row: dict) -> tuple:
+    return (
+        str(row.get("course_id", "")).strip().upper(),
+        str(row.get("section", "")).strip(),
+        str(row.get("academic_year", "")),
+        str(row.get("semester", "")),
+    )
+
+
+def load_existing_courses(path: str) -> dict[tuple, dict]:
+    """기존 courses.csv를 읽어 key → row 딕셔너리로 반환합니다."""
+    existing: dict[tuple, dict] = {}
+    if not os.path.exists(path):
+        return existing
+    with open(path, encoding="utf-8-sig", newline="") as f:
+        for row in csv.DictReader(f):
+            existing[_course_key(row)] = row
+    return existing
+
+
+def merge_into_existing(
+    existing: dict[tuple, dict],
+    new_courses: list[dict],
+) -> list[dict]:
+    """기존 과목에 새 과목을 병합합니다.
+
+    - 같은 키(course_id + section + year + semester)가 있으면
+      기본 필드만 갱신하고 평가 컬럼(rating 등)은 기존 값을 보존합니다.
+    - 새 과목은 평가 컬럼을 빈값으로 추가합니다.
+    """
+    merged = {k: dict(v) for k, v in existing.items()}
+    added = updated = 0
+
+    for course in new_courses:
+        key = _course_key(course)
+        if key in merged:
+            for field in FIELDNAMES:
+                merged[key][field] = course.get(field, merged[key].get(field, ""))
+            updated += 1
+        else:
+            row = dict(course)
+            for col in EVALUATION_COLUMNS:
+                row.setdefault(col, "")
+            merged[key] = row
+            added += 1
+
+    print(f"병합 결과: {added}개 추가, {updated}개 갱신, 기존 유지 {len(existing) - updated}개 → 최종 {len(merged)}개")
+    return list(merged.values())
+
 
 def save_courses(courses: list[dict], output_path: str) -> None:
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        writer = csv.DictWriter(f, fieldnames=ALL_FIELDNAMES, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(courses)
     print(f"{len(courses)}개 과목을 '{output_path}'에 저장했습니다.")
@@ -420,6 +476,8 @@ def main() -> None:
                         help=f"로그인 비밀번호. 환경변수 {ENV_PASSWORD} 가 우선 적용됩니다.")
     parser.add_argument("--output",   default="data/csv/courses.csv",
                         help="저장할 CSV 경로 (기본값: data/csv/courses.csv)")
+    parser.add_argument("--overwrite", action="store_true",
+                        help="기존 CSV를 병합하지 않고 완전히 덮어씁니다")
     parser.add_argument("--headed", action="store_true",
                         help="(무시됨: 항상 브라우저 창이 열립니다)")
     parser.add_argument("--from-ssv", default="",
@@ -522,7 +580,13 @@ def main() -> None:
         print("outputs/debug/ 폴더의 raw_ssv_*.txt 파일을 확인하세요.")
         sys.exit(1)
 
-    save_courses(courses, args.output)
+    if args.overwrite:
+        final_courses = courses
+    else:
+        existing = load_existing_courses(args.output)
+        final_courses = merge_into_existing(existing, courses)
+
+    save_courses(final_courses, args.output)
 
 
 if __name__ == "__main__":
