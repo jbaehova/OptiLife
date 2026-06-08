@@ -4,4 +4,7 @@ matplotlib
 joblib
 fastapi
 uvicorn[standard]
+requests
+beautifulsoup4
+playwright
 pytest
