@@ -1,0 +1,12 @@
+{
+  "hidden_dim": 64,
+  "dropout": 0.5,
+  "lr": 0.001,
+  "weight_decay": 0.0005,
+  "max_features": 5000,
+  "min_df": 1,
+  "ngram_range": [
+    1,
+    2
+  ]
+}
