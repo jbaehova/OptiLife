@@ -1,16 +1,19 @@
+#실제로 bert fine-tuning으로 5fold 후 예측값 생성
+
 import argparse
 import math
+import os
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
 from scipy.stats import pearsonr
-from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-from sklearn.model_selection import train_test_split, GroupKFold
+from sklearn.model_selection import GroupKFold
+from torch.utils.data import Dataset, DataLoader
+from transformers import AutoModel, AutoTokenizer, get_linear_schedule_with_warmup
 
 
 DEFAULT_TARGET_COLUMNS = [
@@ -21,7 +24,7 @@ DEFAULT_TARGET_COLUMNS = [
 
 
 # ============================================================
-# Common utilities
+# Utilities
 # ============================================================
 
 def clean_text(x):
@@ -80,272 +83,11 @@ def evaluate_group_predictions(y_true, y_pred, target_columns, label):
     return pd.DataFrame(rows)
 
 
-def plot_history(history, output_dir, prefix, title):
-    hist = pd.DataFrame(history)
-
-    has_val = (
-        "val_mse" in hist.columns
-        and not hist["val_mse"].isna().all()
-    )
-
-    for log_scale in [False, True]:
-        plt.figure(figsize=(8, 5))
-        plt.plot(hist["epoch"], hist["train_mse"], label="train mse")
-
-        if has_val:
-            plt.plot(hist["epoch"], hist["val_mse"], label="validation mse")
-
-        if log_scale:
-            plt.yscale("log")
-
-        suffix = "_log" if log_scale else ""
-        ylabel = "MSE (log scale)" if log_scale else "MSE"
-        plot_title = title + " - Log Scale" if log_scale else title
-
-        plt.xlabel("Epoch")
-        plt.ylabel(ylabel)
-        plt.title(plot_title)
-        plt.legend()
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(Path(output_dir) / f"{prefix}_loss{suffix}.png", dpi=160)
-        plt.show()
-
-
-def build_vectorized_tensors(train_df, val_df, args, device):
-    vectorizer = TfidfVectorizer(
-        max_features=args.max_features,
-        ngram_range=(1, 2),
-        min_df=args.min_df,
-    )
-
-    X_train = torch.tensor(
-        vectorizer.fit_transform(train_df["raw_review_text"]).toarray(),
-        dtype=torch.float32,
-        device=device,
-    )
-    X_val = torch.tensor(
-        vectorizer.transform(val_df["raw_review_text"]).toarray(),
-        dtype=torch.float32,
-        device=device,
-    )
-
-    return vectorizer, X_train, X_val
-
-
-def build_group_tensors(frame, target_columns, device, target_is_1d=False):
-    keys = sorted(frame["course_key"].unique())
-    key_to_idx = {k: i for i, k in enumerate(keys)}
-
-    group_index = torch.tensor(
-        [key_to_idx[k] for k in frame["course_key"]],
-        dtype=torch.long,
-        device=device,
-    )
-
-    target_df = (
-        frame[["course_key", *target_columns]]
-        .drop_duplicates("course_key")
-        .sort_values("course_key")
-    )
-
-    values = target_df[target_columns].values
-    if target_is_1d:
-        values = values.reshape(-1)
-
-    y = torch.tensor(values, dtype=torch.float32, device=device)
-    return keys, group_index, y
-
-
-def unweighted_group_average(scores, group_index, num_groups):
-    if scores.dim() == 1:
-        score_sum = torch.zeros(num_groups, device=scores.device)
-        count = torch.zeros(num_groups, device=scores.device)
-        score_sum.index_add_(0, group_index, scores)
-        count.index_add_(0, group_index, torch.ones(scores.shape[0], device=scores.device))
-        return score_sum / (count + 1e-8)
-
-    score_sum = torch.zeros(num_groups, scores.shape[1], device=scores.device)
-    count = torch.zeros(num_groups, 1, device=scores.device)
-    score_sum.index_add_(0, group_index, scores)
-    count.index_add_(0, group_index, torch.ones(scores.shape[0], 1, device=scores.device))
-    return score_sum / (count + 1e-8)
-
-
 # ============================================================
-# Model and training
+# Data
 # ============================================================
 
-class SmallScoreModel(nn.Module):
-    def __init__(self, input_dim, output_dim=1, hidden_dim=64, dropout=0.3):
-        super().__init__()
-
-        if hidden_dim <= 0:
-            self.net = nn.Linear(input_dim, output_dim)
-        else:
-            self.net = nn.Sequential(
-                nn.Linear(input_dim, hidden_dim),
-                nn.ReLU(),
-                nn.Dropout(dropout),
-                nn.Linear(hidden_dim, output_dim),
-            )
-
-        self.output_dim = output_dim
-
-    def forward(self, x):
-        raw = self.net(x)
-        if self.output_dim == 1:
-            raw = raw.squeeze(1)
-        return 1.0 + 4.0 * torch.sigmoid(raw)
-
-
-def train_group_average_model(
-    model,
-    optimizer,
-    X_train,
-    y_train,
-    train_group_idx,
-    train_group_count,
-    X_val,
-    args,
-    val_loss_fn,
-    log_name="Epoch",
-):
-    history = []
-    best_val = float("inf")
-    best_epoch = 0
-    best_state = None
-    bad_epochs = 0
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        optimizer.zero_grad()
-
-        train_scores = model(X_train)
-        train_pred_avg = unweighted_group_average(
-            train_scores,
-            train_group_idx,
-            train_group_count,
-        )
-
-        per_course_loss = ((train_pred_avg - y_train) ** 2)
-        if per_course_loss.dim() == 2:
-            per_course_loss = per_course_loss.mean(dim=1)
-
-        course_counts = torch.bincount(
-            train_group_idx,
-            minlength=train_group_count,
-        ).float().to(train_pred_avg.device)
-
-        train_loss = (per_course_loss * course_counts).sum() / course_counts.sum()
-        train_loss.backward()
-        optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            val_mse = val_loss_fn(model, X_val)
-
-        train_mse = float(train_loss.detach().cpu())
-        history.append({"epoch": epoch, "train_mse": train_mse, "val_mse": val_mse})
-
-        if val_mse < best_val - args.min_delta:
-            best_val = val_mse
-            best_epoch = epoch
-            bad_epochs = 0
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-        else:
-            bad_epochs += 1
-
-        if epoch == 1 or epoch % args.log_every == 0:
-            print(f"{log_name} {epoch:03d} | train_mse={train_mse:.4f} | val_mse={val_mse:.4f}")
-
-        if args.early_stop and bad_epochs >= args.patience:
-            print(
-                f"early stopping at epoch {epoch} | "
-                f"best_epoch={best_epoch} | best_val_mse={best_val:.4f}"
-            )
-            break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    return history, best_epoch
-
-
-
-def train_group_average_model_full(
-    model,
-    optimizer,
-    X_train,
-    y_train,
-    train_group_idx,
-    train_group_count,
-    args,
-    full_epochs,
-    log_name="Final Epoch"
-):
-    """
-    Final full-data training for feature generation.
-    No validation, no early stopping, no best-state selection.
-    This intentionally uses all available data to train the final feature extractor.
-    """
-    history = []
-
-    for epoch in range(1, full_epochs + 1):
-        model.train()
-        optimizer.zero_grad()
-
-        train_scores = model(X_train)
-        train_pred_avg = unweighted_group_average(
-            train_scores,
-            train_group_idx,
-            train_group_count,
-        )
-
-        per_course_loss = ((train_pred_avg - y_train) ** 2)
-        if per_course_loss.dim() == 2:
-            per_course_loss = per_course_loss.mean(dim=1)
-
-        course_counts = torch.bincount(
-            train_group_idx,
-            minlength=train_group_count,
-        ).float().to(train_pred_avg.device)
-
-        train_loss = (per_course_loss * course_counts).sum() / course_counts.sum()
-        train_loss.backward()
-        optimizer.step()
-
-        train_mse = float(train_loss.detach().cpu())
-        history.append({"epoch": epoch, "train_mse": train_mse})
-
-        if epoch == 1 or epoch % args.log_every == 0:
-            print(f"{log_name} {epoch:03d} | train_mse={train_mse:.4f}")
-
-    return history
-
-
-def make_model_and_optimizer(input_dim, output_dim, args, device):
-    model = SmallScoreModel(
-        input_dim=input_dim,
-        output_dim=output_dim,
-        hidden_dim=args.hidden_dim,
-        dropout=args.dropout,
-    ).to(device)
-
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-
-    return model, optimizer
-
-
-# ============================================================
-# Main experiment
-# ============================================================
-
-def load_and_merge_main(raw_path, courses_path, target_columns):
+def load_and_merge_data(raw_path, courses_path, target_columns):
     raw = pd.read_csv(raw_path)
     courses = pd.read_csv(courses_path)
 
@@ -378,23 +120,307 @@ def load_and_merge_main(raw_path, courses_path, target_columns):
         .rename(columns={col: f"target_{col}" for col in target_columns})
     )
 
-    target_merged_columns = [f"target_{c}" for c in target_columns]
+    target_columns_merged = [f"target_{c}" for c in target_columns]
+
     data = raw.merge(course_targets, on="course_key", how="inner")
     data["raw_review_text"] = data["raw_review_text"].apply(clean_text)
     data = data[data["raw_review_text"].str.len() > 0].reset_index(drop=True)
 
     if data.empty:
-        raise ValueError("No merged reviews.")
+        raise ValueError("No merged reviews. Check course_name/professor matching.")
 
-    return data, target_merged_columns
+    return data, target_columns_merged
 
 
-def add_review_prediction_columns(frame, scores, target_columns, pred_suffix=""):
+def build_course_target_table(frame, target_columns_merged):
+    target_df = (
+        frame[["course_key", *target_columns_merged]]
+        .drop_duplicates("course_key")
+        .sort_values("course_key")
+        .reset_index(drop=True)
+    )
+    return target_df
+
+
+# ============================================================
+# BERT model
+# ============================================================
+
+class ReviewDataset(Dataset):
+    def __init__(self, texts, labels=None):
+        self.texts = list(texts)
+        self.labels = None if labels is None else np.asarray(labels, dtype=np.float32)
+
+    def __len__(self):
+        return len(self.texts)
+
+    def __getitem__(self, idx):
+        if self.labels is None:
+            return self.texts[idx]
+        return self.texts[idx], self.labels[idx]
+
+
+class BertRegressor(nn.Module):
+    def __init__(self, model_name, output_dim, dropout=0.1):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained(model_name)
+        hidden = self.bert.config.hidden_size
+        self.dropout = nn.Dropout(dropout)
+        self.head = nn.Linear(hidden, output_dim)
+
+    def forward(self, input_ids, attention_mask, token_type_ids=None):
+        kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        if token_type_ids is not None:
+            kwargs["token_type_ids"] = token_type_ids
+
+        out = self.bert(**kwargs)
+
+        if hasattr(out, "pooler_output") and out.pooler_output is not None:
+            pooled = out.pooler_output
+        else:
+            pooled = out.last_hidden_state[:, 0, :]
+
+        raw = self.head(self.dropout(pooled))
+        return 1.0 + 4.0 * torch.sigmoid(raw)
+
+
+def make_collate_fn(tokenizer, max_length, has_labels):
+    def collate(batch):
+        if has_labels:
+            texts, labels = zip(*batch)
+        else:
+            texts = batch
+            labels = None
+
+        enc = tokenizer(
+            list(texts),
+            padding=True,
+            truncation=True,
+            max_length=max_length,
+            return_tensors="pt",
+        )
+
+        if labels is None:
+            return enc
+
+        labels = torch.tensor(np.asarray(labels, dtype=np.float32), dtype=torch.float32)
+        return enc, labels
+
+    return collate
+
+
+def repeated_course_targets(frame, target_columns_merged):
+    return frame[target_columns_merged].values.astype(np.float32)
+
+
+def train_bert_model(train_df, val_df, target_columns_merged, args, device, fold_name="Fold"):
+    tokenizer = AutoTokenizer.from_pretrained(args.bert_model)
+
+    train_labels = repeated_course_targets(train_df, target_columns_merged)
+    val_labels = repeated_course_targets(val_df, target_columns_merged)
+
+    train_ds = ReviewDataset(train_df["raw_review_text"].values, train_labels)
+    val_ds = ReviewDataset(val_df["raw_review_text"].values, val_labels)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.bert_batch_size,
+        shuffle=True,
+        collate_fn=make_collate_fn(tokenizer, args.bert_max_length, has_labels=True),
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.bert_batch_size,
+        shuffle=False,
+        collate_fn=make_collate_fn(tokenizer, args.bert_max_length, has_labels=True),
+    )
+
+    model = BertRegressor(
+        model_name=args.bert_model,
+        output_dim=len(target_columns_merged),
+        dropout=args.bert_dropout,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.bert_lr,
+        weight_decay=args.bert_weight_decay,
+    )
+
+    total_steps = max(len(train_loader) * args.bert_epochs, 1)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_steps * args.bert_warmup_ratio),
+        num_training_steps=total_steps,
+    )
+
+    criterion = nn.MSELoss()
+    best_val = float("inf")
+    best_epoch = 0
+    best_state = None
+    history = []
+
+    for epoch in range(1, args.bert_epochs + 1):
+        model.train()
+        train_total = 0.0
+        train_count = 0
+
+        for step, (enc, labels) in enumerate(train_loader, start=1):
+            enc = {k: v.to(device) for k, v in enc.items()}
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            pred = model(**enc)
+            loss = criterion(pred, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.bert_grad_clip)
+            optimizer.step()
+            scheduler.step()
+
+            batch_size = labels.shape[0]
+            train_total += float(loss.detach().cpu()) * batch_size
+            train_count += batch_size
+
+            if step == 1 or step % args.bert_log_every == 0 or step == len(train_loader):
+                print(
+                    f"{fold_name} epoch {epoch}/{args.bert_epochs} "
+                    f"| step {step}/{len(train_loader)} "
+                    f"| train_mse={train_total / max(train_count, 1):.4f}"
+                )
+
+        model.eval()
+        val_total = 0.0
+        val_count = 0
+        with torch.no_grad():
+            for enc, labels in val_loader:
+                enc = {k: v.to(device) for k, v in enc.items()}
+                labels = labels.to(device)
+                pred = model(**enc)
+                loss = criterion(pred, labels)
+                batch_size = labels.shape[0]
+                val_total += float(loss.detach().cpu()) * batch_size
+                val_count += batch_size
+
+        train_mse = train_total / max(train_count, 1)
+        val_mse = val_total / max(val_count, 1)
+        history.append({"epoch": epoch, "train_mse": train_mse, "val_mse": val_mse})
+
+        print(
+            f"{fold_name} epoch {epoch} done "
+            f"| train_mse={train_mse:.4f} | val_mse={val_mse:.4f}"
+        )
+
+        if val_mse < best_val:
+            best_val = val_mse
+            best_epoch = epoch
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    return model, tokenizer, history, best_epoch
+
+
+def train_bert_full_model(data, target_columns_merged, args, device, full_epochs):
+    tokenizer = AutoTokenizer.from_pretrained(args.bert_model)
+
+    labels = repeated_course_targets(data, target_columns_merged)
+    train_ds = ReviewDataset(data["raw_review_text"].values, labels)
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.bert_batch_size,
+        shuffle=True,
+        collate_fn=make_collate_fn(tokenizer, args.bert_max_length, has_labels=True),
+    )
+
+    model = BertRegressor(
+        model_name=args.bert_model,
+        output_dim=len(target_columns_merged),
+        dropout=args.bert_dropout,
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=args.bert_lr,
+        weight_decay=args.bert_weight_decay,
+    )
+
+    total_steps = max(len(train_loader) * full_epochs, 1)
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=int(total_steps * args.bert_warmup_ratio),
+        num_training_steps=total_steps,
+    )
+
+    criterion = nn.MSELoss()
+    history = []
+
+    for epoch in range(1, full_epochs + 1):
+        model.train()
+        train_total = 0.0
+        train_count = 0
+
+        for step, (enc, labels) in enumerate(train_loader, start=1):
+            enc = {k: v.to(device) for k, v in enc.items()}
+            labels = labels.to(device)
+
+            optimizer.zero_grad()
+            pred = model(**enc)
+            loss = criterion(pred, labels)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.bert_grad_clip)
+            optimizer.step()
+            scheduler.step()
+
+            batch_size = labels.shape[0]
+            train_total += float(loss.detach().cpu()) * batch_size
+            train_count += batch_size
+
+            if step == 1 or step % args.bert_log_every == 0 or step == len(train_loader):
+                print(
+                    f"Final epoch {epoch}/{full_epochs} "
+                    f"| step {step}/{len(train_loader)} "
+                    f"| train_mse={train_total / max(train_count, 1):.4f}"
+                )
+
+        train_mse = train_total / max(train_count, 1)
+        history.append({"epoch": epoch, "train_mse": train_mse})
+        print(f"Final epoch {epoch} done | train_mse={train_mse:.4f}")
+
+    return model, tokenizer, history
+
+
+def predict_bert(model, tokenizer, frame, args, device):
+    ds = ReviewDataset(frame["raw_review_text"].values, labels=None)
+    loader = DataLoader(
+        ds,
+        batch_size=args.bert_batch_size,
+        shuffle=False,
+        collate_fn=make_collate_fn(tokenizer, args.bert_max_length, has_labels=False),
+    )
+
+    model.eval()
+    preds = []
+    with torch.no_grad():
+        for enc in loader:
+            enc = {k: v.to(device) for k, v in enc.items()}
+            pred = model(**enc)
+            preds.append(pred.detach().cpu().numpy())
+
+    return np.clip(np.vstack(preds), 1.0, 5.0)
+
+
+# ============================================================
+# Output helpers
+# ============================================================
+
+def add_prediction_columns(frame, scores, target_columns, suffix=""):
     out = frame.copy()
-
     for i, col in enumerate(target_columns):
-        out[f"review_pred_{col}{pred_suffix}"] = scores[:, i]
-
+        out[f"review_pred_{col}{suffix}"] = scores[:, i]
     return out
 
 
@@ -416,10 +442,7 @@ def add_scaled_prediction_columns(df, target_columns, pred_suffix="", scaled_suf
             .reset_index()
         )
 
-        course_stats[scale_col] = (
-            course_stats["true_mean"] /
-            (course_stats["pred_mean"] + 1e-8)
-        )
+        course_stats[scale_col] = course_stats["true_mean"] / (course_stats["pred_mean"] + 1e-8)
 
         out = out.merge(
             course_stats[["course_key", scale_col]],
@@ -432,261 +455,129 @@ def add_scaled_prediction_columns(df, target_columns, pred_suffix="", scaled_suf
     return out
 
 
-def build_oof_predictions(data, target_merged_columns, target_columns, args, device):
-    fold_metrics = []
-    best_epochs = []
-    n_splits = min(args.n_splits, data["course_key"].nunique())
-
-    if n_splits < 2:
-        raise ValueError("Need at least 2 course groups for OOF predictions.")
-
-    oof_scores = np.zeros((len(data), len(target_columns)), dtype=np.float32)
-    groups = data["course_key"].values
-    gkf = GroupKFold(n_splits=n_splits)
-
-    for fold, (train_idx, val_idx) in enumerate(
-        gkf.split(data, groups=groups),
-        start=1,
-    ):
-        print("\n" + "-" * 80)
-        print(f"OOF Fold {fold}/{n_splits}")
-        print("-" * 80)
-
-        train_df = data.iloc[train_idx].reset_index(drop=True)
-        val_df = data.iloc[val_idx].reset_index(drop=True)
-
-        print(f"fold train reviews: {len(train_df)}, train courses: {train_df['course_key'].nunique()}")
-        print(f"fold val reviews: {len(val_df)}, val courses: {val_df['course_key'].nunique()}")
-
-        _, X_train, X_val = build_vectorized_tensors(train_df, val_df, args, device)
-
-        train_group_keys, train_group_idx, y_train = build_group_tensors(
-            train_df,
-            target_merged_columns,
-            device,
-        )
-        val_group_keys, val_group_idx, y_val = build_group_tensors(
-            val_df,
-            target_merged_columns,
-            device,
-        )
-
-        model, optimizer = make_model_and_optimizer(
-            input_dim=X_train.shape[1],
-            output_dim=len(target_columns),
-            args=args,
-            device=device,
-        )
-
-        def val_loss_fn(model, X_val):
-            val_scores = model(X_val)
-            val_pred_avg = unweighted_group_average(
-                val_scores,
-                val_group_idx,
-                len(val_group_keys),
-            )
-            return float(nn.MSELoss()(val_pred_avg, y_val).detach().cpu())
-
-        history, best_epoch = train_group_average_model(
-            model,
-            optimizer,
-            X_train,
-            y_train,
-            train_group_idx,
-            len(train_group_keys),
-            X_val,
-            args,
-            val_loss_fn,
-            log_name=f"OOF Fold {fold} Epoch",
-        )
-        best_epochs.append(best_epoch)
-
-        model.eval()
-        with torch.no_grad():
-            fold_scores = model(X_val).detach().cpu().numpy()
-
-        oof_scores[val_idx] = fold_scores
-        fold_pred_avg = unweighted_group_average(
-            torch.tensor(fold_scores, device=device),
-            val_group_idx,
-            len(val_group_keys),
-        ).cpu().numpy()
-
-        fold_true = y_val.cpu().numpy()
-
-        fold_result = evaluate_group_predictions(
-            fold_true,
-            fold_pred_avg,
-            target_columns,
-            f"fold_{fold}",
-        )
-
-        fold_result.insert(0, "fold", fold)
-
-        fold_metrics.append(fold_result)
-
-        print("\nFold Metrics")
-        print(fold_result.to_string(index=False))
-
-    fold_metrics_df = pd.concat(
-        fold_metrics,
-        ignore_index=True,
-    )
-
-    return oof_scores, best_epochs, fold_metrics_df
-
-
-def train_final_model_on_all_data(data, target_merged_columns, target_columns, args, device, full_epochs):
-    print("\n" + "=" * 80)
-    print("TRAINING FINAL MAIN MODEL ON ALL DATA FOR OUTPUT FEATURES")
-    print("=" * 80)
-
-    vectorizer = TfidfVectorizer(
-        max_features=args.max_features,
-        ngram_range=(1, 2),
-        min_df=args.min_df,
-    )
-
-    X_all = torch.tensor(
-        vectorizer.fit_transform(data["raw_review_text"]).toarray(),
-        dtype=torch.float32,
-        device=device,
-    )
-
-    group_keys, group_idx, y_all = build_group_tensors(
-        data,
-        target_merged_columns,
-        device,
-    )
-
-    model, optimizer = make_model_and_optimizer(
-        input_dim=X_all.shape[1],
-        output_dim=len(target_columns),
-        args=args,
-        device=device,
-    )
-
-    history = train_group_average_model_full(
-        model=model,
-        optimizer=optimizer,
-        X_train=X_all,
-        y_train=y_all,
-        train_group_idx=group_idx,
-        train_group_count=len(group_keys),
-        args=args,
-        full_epochs=full_epochs,
-        log_name="Final Epoch",
-    )
-
-    model.eval()
-    with torch.no_grad():
-        all_scores = model(X_all).detach().cpu().numpy()
-
-    return history, all_scores
-
-
-def build_oof_course_metrics(data, oof_scores, target_merged_columns, target_columns):
+def build_course_metrics(data, scores, target_columns, target_columns_merged, model_name):
     pred_df = pd.DataFrame({"course_key": data["course_key"].values})
 
     for i, col in enumerate(target_columns):
-        pred_df[f"pred_{col}"] = oof_scores[:, i]
+        pred_df[f"pred_{col}"] = scores[:, i]
 
-    for target_col in target_merged_columns:
-        pred_df[target_col] = data[target_col].values
+    for col in target_columns_merged:
+        pred_df[col] = data[col].values
 
-    course_pred_df = (
-        pred_df
-        .groupby("course_key", as_index=False)
+    course_pred = (
+        pred_df.groupby("course_key", as_index=False)
         .agg({
             **{f"pred_{col}": "mean" for col in target_columns},
-            **{target_col: "first" for target_col in target_merged_columns},
+            **{col: "first" for col in target_columns_merged},
         })
         .sort_values("course_key")
         .reset_index(drop=True)
     )
 
-    y_true = course_pred_df[target_merged_columns].values
-    y_pred = course_pred_df[[f"pred_{col}" for col in target_columns]].values
+    y_true = course_pred[target_columns_merged].values
+    y_pred = course_pred[[f"pred_{col}" for col in target_columns]].values
 
-    baseline_mean = y_true.mean(axis=0)
-    baseline_global = np.tile(baseline_mean, (len(y_true), 1))
+    metrics = evaluate_group_predictions(y_true, y_pred, target_columns, model_name)
 
-    metrics = pd.concat([
-        evaluate_group_predictions(
-            y_true,
-            baseline_global,
-            target_columns,
-            "main_baseline_global_mean",
-        ),
-        evaluate_group_predictions(
-            y_true,
-            y_pred,
-            target_columns,
-            "main_tfidf_mlp_oof",
-        ),
-    ], ignore_index=True)
-
-    validation_predictions = pd.DataFrame({
-        "course_key": course_pred_df["course_key"].values
-    })
-
+    predictions = pd.DataFrame({"course_key": course_pred["course_key"].values})
     for i, col in enumerate(target_columns):
-        validation_predictions[f"true_{col}"] = y_true[:, i]
-        validation_predictions[f"pred_{col}"] = y_pred[:, i]
-        validation_predictions[f"baseline_{col}"] = baseline_global[:, i]
+        predictions[f"true_{col}"] = y_true[:, i]
+        predictions[f"pred_{col}"] = y_pred[:, i]
 
-    return metrics, validation_predictions
+    return metrics, predictions
 
 
-def run_main_experiment(args, device):
-    print("\n" + "=" * 80)
-    print("MAIN EXPERIMENT: 5-fold GroupKFold OOF evaluation + final full-data output")
-    print("=" * 80)
+# ============================================================
+# Main
+# ============================================================
 
+def run_experiment(args):
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
     target_columns = parse_targets(args.targets)
-    data, target_merged_columns = load_and_merge_main(args.raw, args.courses, target_columns)
+
+    data, target_columns_merged = load_and_merge_data(args.raw, args.courses, target_columns)
 
     print("device:", device)
+    print("model:", args.bert_model)
     print("targets:", target_columns)
-    print(f"merged reviews: {len(data)}")
-    print(f"course groups: {data['course_key'].nunique()}")
+    print("merged reviews:", len(data))
+    print("course groups:", data["course_key"].nunique())
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    metrics_path = output_dir / "main_validation_metrics.csv"
-    history_path = output_dir / "main_training_history.csv"
-    pred_path = output_dir / "main_validation_predictions.csv"
-    qualitative_path = output_dir / "main_qualitative_review_predictions.csv"
-    all_qualitative_path = output_dir / "main_all_review_predictions.csv"
+    fold_metrics_path = output_dir / "bert_fold_metrics.csv"
+    fold_predictions_path = output_dir / "bert_fold_course_predictions.csv"
+    qualitative_path = output_dir / "bert_qualitative_review_predictions.csv"
+    all_predictions_path = output_dir / "bert_all_review_predictions.csv"
+    final_history_path = output_dir / "bert_final_training_history.csv"
 
     # ------------------------------------------------------------
-    # 1. OOF evaluation only
-    #    Each review is predicted by a model that did not train on its course.
+    # 1. GroupKFold quality evaluation
     # ------------------------------------------------------------
     print("\n" + "=" * 80)
-    print(f"BUILDING {args.n_splits}-FOLD GROUP OOF REVIEW PREDICTIONS FOR MAIN EVALUATION")
+    print(f"BUILDING {args.n_splits}-FOLD GROUP BERT PREDICTIONS FOR QUALITY CHECK")
     print("=" * 80)
 
-    oof_scores, best_epochs, fold_metrics_df = build_oof_predictions(
-        data=data,
-        target_merged_columns=target_merged_columns,
-        target_columns=target_columns,
-        args=args,
-        device=device,
-    )
+    n_splits = min(args.n_splits, data["course_key"].nunique())
+    gkf = GroupKFold(n_splits=n_splits)
+    groups = data["course_key"].values
 
-    recommended_epoch = round(np.mean(best_epochs))
+    oof_scores = np.zeros((len(data), len(target_columns)), dtype=np.float32)
+    fold_metric_frames = []
+    fold_prediction_frames = []
+    best_epochs = []
 
-    metrics, validation_predictions = build_oof_course_metrics(
-        data=data,
-        oof_scores=oof_scores,
-        target_merged_columns=target_merged_columns,
-        target_columns=target_columns,
-    )
+    for fold, (train_idx, val_idx) in enumerate(gkf.split(data, groups=groups), start=1):
+        print("\n" + "-" * 80)
+        print(f"BERT Fold {fold}/{n_splits}")
+        print("-" * 80)
 
-    metrics.to_csv(metrics_path, index=False, encoding="utf-8-sig")
-    validation_predictions.to_csv(pred_path, index=False, encoding="utf-8-sig")
+        train_df = data.iloc[train_idx].reset_index(drop=True)
+        val_df = data.iloc[val_idx].reset_index(drop=True)
+
+        print(f"train reviews={len(train_df)}, train courses={train_df['course_key'].nunique()}")
+        print(f"val reviews={len(val_df)}, val courses={val_df['course_key'].nunique()}")
+
+        model, tokenizer, history, best_epoch = train_bert_model(
+            train_df=train_df,
+            val_df=val_df,
+            target_columns_merged=target_columns_merged,
+            args=args,
+            device=device,
+            fold_name=f"BERT Fold {fold}",
+        )
+        best_epochs.append(best_epoch)
+
+        fold_scores = predict_bert(model, tokenizer, val_df, args, device)
+        oof_scores[val_idx] = fold_scores
+
+        fold_metrics, fold_predictions = build_course_metrics(
+            data=val_df,
+            scores=fold_scores,
+            target_columns=target_columns,
+            target_columns_merged=target_columns_merged,
+            model_name=f"bert_fold_{fold}",
+        )
+        fold_metrics.insert(0, "fold", fold)
+        fold_predictions.insert(0, "fold", fold)
+
+        fold_metric_frames.append(fold_metrics)
+        fold_prediction_frames.append(fold_predictions)
+
+        print("\nFold metrics")
+        print(fold_metrics.to_string(index=False))
+
+    fold_metrics_df = pd.concat(fold_metric_frames, ignore_index=True)
+    fold_predictions_df = pd.concat(fold_prediction_frames, ignore_index=True)
+
+    fold_metrics_df.to_csv(fold_metrics_path, index=False, encoding="utf-8-sig")
+    fold_predictions_df.to_csv(fold_predictions_path, index=False, encoding="utf-8-sig")
 
     qualitative_cols = ["course_key", "course_name", "professor", "raw_review_text"]
     if "semester" in data.columns:
@@ -694,11 +585,11 @@ def run_main_experiment(args, device):
     if "rating" in data.columns:
         qualitative_cols.insert(4, "rating")
 
-    qualitative_df = add_review_prediction_columns(
-        data[qualitative_cols + target_merged_columns],
+    qualitative_df = add_prediction_columns(
+        data[qualitative_cols + target_columns_merged],
         oof_scores,
         target_columns,
-        pred_suffix="_oof",
+        suffix="_oof",
     )
     qualitative_df = add_scaled_prediction_columns(
         qualitative_df,
@@ -707,268 +598,51 @@ def run_main_experiment(args, device):
     )
     qualitative_df.to_csv(qualitative_path, index=False, encoding="utf-8-sig")
 
+    recommended_epoch = max(1, round(float(np.mean(best_epochs))))
+    print("\nOOF best epochs:", best_epochs)
+    print("Recommended full-data epochs:", recommended_epoch)
+
     # ------------------------------------------------------------
-    # 2. Final output for Model 2
-    #    Train one final model on all data, then predict all reviews.
+    # 2. Final full-data model for Model2 input
     # ------------------------------------------------------------
-    final_history, final_scores = train_final_model_on_all_data(
+    print("\n" + "=" * 80)
+    print("TRAINING FINAL BERT MODEL ON ALL DATA FOR MODEL2 INPUT")
+    print("=" * 80)
+
+    full_epochs = args.final_epochs if args.final_epochs > 0 else recommended_epoch
+
+    final_model, final_tokenizer, final_history = train_bert_full_model(
         data=data,
-        target_merged_columns=target_merged_columns,
-        target_columns=target_columns,
+        target_columns_merged=target_columns_merged,
         args=args,
         device=device,
-        full_epochs=recommended_epoch,
+        full_epochs=full_epochs,
     )
 
-    pd.DataFrame(final_history).to_csv(history_path, index=False, encoding="utf-8-sig")
-    plot_history(
-        final_history,
-        output_dir,
-        prefix="main_final_full_data",
-        title="Final Main Model Train MSE on All Data",
-    )
+    pd.DataFrame(final_history).to_csv(final_history_path, index=False, encoding="utf-8-sig")
 
-    all_qualitative_df = add_review_prediction_columns(
-        data[qualitative_cols + target_merged_columns],
+    final_scores = predict_bert(final_model, final_tokenizer, data, args, device)
+
+    all_predictions_df = add_prediction_columns(
+        data[qualitative_cols + target_columns_merged],
         final_scores,
         target_columns,
     )
-    all_qualitative_df = add_scaled_prediction_columns(
-        all_qualitative_df,
+    all_predictions_df = add_scaled_prediction_columns(
+        all_predictions_df,
         target_columns,
     )
-    all_qualitative_df.to_csv(all_qualitative_path, index=False, encoding="utf-8-sig")
+    all_predictions_df.to_csv(all_predictions_path, index=False, encoding="utf-8-sig")
 
-    print("\n=== MAIN OOF Validation Metrics ===")
-    print(metrics.to_string(index=False))
-    print("\nMAIN saved:")
-    print(metrics_path)
-    print(history_path)
-    print(pred_path)
+    print("\n=== BERT Fold Metrics ===")
+    print(fold_metrics_df.to_string(index=False))
+
+    print("\nsaved:")
+    print(fold_metrics_path)
+    print(fold_predictions_path)
     print(qualitative_path)
-    print(all_qualitative_path)
-
-    return metrics
-
-
-# ============================================================
-# Rating sanity check
-# ============================================================
-
-def load_raw_reviews_for_rating(raw_path):
-    raw = pd.read_csv(raw_path)
-
-    required = ["course_name", "professor", "rating", "raw_review_text"]
-    missing = [c for c in required if c not in raw.columns]
-    if missing:
-        raise ValueError(f"raw file missing columns for rating sanity check: {missing}")
-
-    raw = raw.copy()
-    raw["course_key"] = make_course_key(raw)
-    raw["raw_review_text"] = raw["raw_review_text"].apply(clean_text)
-    raw["rating"] = pd.to_numeric(raw["rating"], errors="coerce")
-
-    raw = raw[
-        raw["raw_review_text"].str.len().gt(0)
-        & raw["rating"].notna()
-    ].reset_index(drop=True)
-
-    raw["rating"] = raw["rating"].clip(1.0, 5.0)
-
-    if raw.empty:
-        raise ValueError("No usable reviews for rating sanity check.")
-
-    raw["course_mean_rating"] = raw.groupby("course_key")["rating"].transform("mean")
-
-    return raw
-
-
-def run_rating_sanity_check(args, device):
-    print("\n" + "=" * 80)
-    print("RATING SANITY CHECK: train on course mean rating, evaluate on review rating")
-    print("=" * 80)
-
-    raw = load_raw_reviews_for_rating(args.raw)
-
-    train_df, val_df = train_test_split(
-        raw,
-        test_size=args.val_size,
-        random_state=args.seed,
-        shuffle=True,
-    )
-
-    print(f"usable reviews: {len(raw)}")
-    print(f"course groups: {raw['course_key'].nunique()}")
-    print(f"rating train reviews: {len(train_df)}")
-    print(f"rating validation reviews: {len(val_df)}")
-
-    _, X_train, X_val = build_vectorized_tensors(train_df, val_df, args, device)
-
-    y_train = torch.tensor(
-        train_df["course_mean_rating"].values,
-        dtype=torch.float32,
-        device=device,
-    )
-
-    y_val_true = val_df["rating"].values
-    baseline_course_mean = val_df["course_mean_rating"].values
-
-    model, optimizer = make_model_and_optimizer(
-        input_dim=X_train.shape[1],
-        output_dim=1,
-        args=args,
-        device=device,
-    )
-
-    def val_loss_fn(model, X_val):
-        pred = model(X_val).detach().cpu().numpy()
-        return mean_squared_error(y_val_true, pred)
-
-    history = []
-    criterion = nn.MSELoss()
-    best_val = float("inf")
-    best_state = None
-    bad_epochs = 0
-
-    for epoch in range(1, args.epochs + 1):
-        model.train()
-        optimizer.zero_grad()
-
-        pred_train = model(X_train)
-        train_loss = criterion(pred_train, y_train)
-        train_loss.backward()
-        optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            val_mse = val_loss_fn(model, X_val)
-
-        train_mse = float(train_loss.detach().cpu())
-        history.append({"epoch": epoch, "train_mse": train_mse, "val_mse": val_mse})
-
-        if val_mse < best_val - args.min_delta:
-            best_val = val_mse
-            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-            bad_epochs = 0
-        else:
-            bad_epochs += 1
-
-        if epoch == 1 or epoch % args.log_every == 0:
-            print(f"Rating Epoch {epoch:03d} | train_mse={train_mse:.4f} | val_mse={val_mse:.4f}")
-
-        if args.early_stop and bad_epochs >= args.patience:
-            print(f"rating early stopping at epoch {epoch} | best_val_mse={best_val:.4f}")
-            break
-
-    if best_state is not None:
-        model.load_state_dict(best_state)
-
-    model.eval()
-    with torch.no_grad():
-        pred_rating = model(X_val).detach().cpu().numpy()
-
-    output_dir = Path(args.rating_output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    metrics_path = output_dir / "rating_sanity_metrics.csv"
-    history_path = output_dir / "rating_sanity_training_history.csv"
-    review_pred_path = output_dir / "rating_sanity_review_predictions.csv"
-
-    val_review_out = val_df[
-        ["course_key", "course_name", "professor", "rating", "course_mean_rating", "raw_review_text"]
-    ].copy()
-
-    if "semester" in val_df.columns:
-        val_review_out.insert(3, "semester", val_df["semester"].values)
-
-    val_review_out = val_review_out.rename(columns={
-        "rating": "true_rating",
-        "course_mean_rating": "baseline_course_mean_rating",
-    })
-
-    val_review_out["pred_rating"] = pred_rating
-
-    course_stats = (
-        val_review_out.groupby("course_key")
-        .agg(
-            pred_mean=("pred_rating", "mean"),
-            true_mean=("baseline_course_mean_rating", "first"),
-        )
-        .reset_index()
-    )
-
-    course_stats["scale"] = (
-        course_stats["true_mean"] /
-        (course_stats["pred_mean"] + 1e-8)
-    )
-
-    val_review_out = val_review_out.merge(
-        course_stats[["course_key", "scale"]],
-        on="course_key",
-        how="left",
-    )
-
-    val_review_out["pred_rating_scaled"] = (
-        val_review_out["pred_rating"] *
-        val_review_out["scale"]
-    ).clip(1.0, 5.0)
-
-    metrics = pd.DataFrame([
-        evaluate_predictions(
-            y_val_true,
-            baseline_course_mean,
-            "rating_baseline_course_mean",
-        ),
-        evaluate_predictions(
-            y_val_true,
-            pred_rating,
-            "rating_review_text_model",
-        ),
-        evaluate_predictions(
-            y_val_true,
-            val_review_out["pred_rating_scaled"].values,
-            "rating_review_text_model_scaled_to_course_mean",
-        ),
-    ])
-
-    metrics.to_csv(metrics_path, index=False, encoding="utf-8-sig")
-    pd.DataFrame(history).to_csv(history_path, index=False, encoding="utf-8-sig")
-    val_review_out.to_csv(review_pred_path, index=False, encoding="utf-8-sig")
-
-    plot_history(
-        history,
-        output_dir,
-        prefix="rating_sanity",
-        title="Rating Sanity Check: Course Mean vs Review Text Model",
-    )
-
-    print("\n=== RATING Sanity Check Metrics ===")
-    print(metrics.to_string(index=False))
-    print("\nRATING saved:")
-    print(metrics_path)
-    print(history_path)
-    print(review_pred_path)
-
-    return metrics
-
-
-# ============================================================
-# CLI
-# ============================================================
-
-def add_common_training_args(parser):
-    parser.add_argument("--epochs", type=int, default=800)
-    parser.add_argument("--final-epochs", type=int, default=800)
-    parser.add_argument("--log-every", type=int, default=100)
-    parser.add_argument("--max-features", type=int, default=5000)
-    parser.add_argument("--min-df", type=int, default=2)
-    parser.add_argument("--hidden-dim", type=int, default=64)
-    parser.add_argument("--dropout", type=float, default=0.3)
-    parser.add_argument("--lr", type=float, default=5e-4)
-    parser.add_argument("--weight-decay", type=float, default=5e-4)
-    parser.add_argument("--early-stop", action="store_true", default=True)
-    parser.add_argument("--patience", type=int, default=80)
-    parser.add_argument("--min-delta", type=float, default=1e-4)
+    print(all_predictions_path)
+    print(final_history_path)
 
 
 def get_args():
@@ -978,46 +652,42 @@ def get_args():
         "--raw",
         default="scripts/examples/train_course_attribute_model/input/raw_everytime_reviews.csv",
     )
-    
     parser.add_argument(
         "--courses",
         default="scripts/examples/train_course_attribute_model/input/courses.csv",
     )
-    
     parser.add_argument(
         "--output-dir",
-        default="scripts/examples/train_course_attribute_model/output/main_model",
+        default="scripts/examples/train_course_attribute_model/output/bert_course_attribute_model",
     )
-    
     parser.add_argument(
-        "--rating-output-dir",
-        default="scripts/examples/train_course_attribute_model/output/rating_sanity",
+        "--targets",
+        default=",".join(DEFAULT_TARGET_COLUMNS),
     )
-    parser.add_argument("--targets", default=",".join(DEFAULT_TARGET_COLUMNS))
-    parser.add_argument("--val-size", type=float, default=0.2)
     parser.add_argument("--n-splits", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cpu", action="store_true")
 
-    parser.add_argument("--run-rating-check", action="store_true", default=True)
-    parser.add_argument("--no-rating-check", dest="run_rating_check", action="store_false")
+    parser.add_argument("--bert-model", default="klue/bert-base")
+    parser.add_argument("--bert-epochs", type=int, default=1)
+    parser.add_argument(
+        "--final-epochs",
+        type=int,
+        default=0,
+        help="0 means use the average best epoch from GroupKFold.",
+    )
+    parser.add_argument("--bert-batch-size", type=int, default=16)
+    parser.add_argument("--bert-max-length", type=int, default=128)
+    parser.add_argument("--bert-lr", type=float, default=2e-5)
+    parser.add_argument("--bert-weight-decay", type=float, default=0.01)
+    parser.add_argument("--bert-warmup-ratio", type=float, default=0.1)
+    parser.add_argument("--bert-dropout", type=float, default=0.1)
+    parser.add_argument("--bert-grad-clip", type=float, default=1.0)
+    parser.add_argument("--bert-log-every", type=int, default=50)
 
-    add_common_training_args(parser)
     args, _ = parser.parse_known_args()
     return args
 
 
-def main():
-    args = get_args()
-    device = torch.device("cuda" if torch.cuda.is_available() and not args.cpu else "cpu")
-
-    run_main_experiment(args, device)
-
-    if args.run_rating_check:
-        run_rating_sanity_check(args, device)
-    else:
-        print("\nRating sanity check skipped. Main outputs are unaffected.")
-
-
 if __name__ == "__main__":
-    main()
+    run_experiment(get_args())
