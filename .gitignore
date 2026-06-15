@@ -14,10 +14,8 @@ htmlcov/
 outputs/
 *.log
 data/previous/
-# Canonical mock course catalog is part of the shared data contract.
 data/csv/courses.csv
 !data/csv/courses.csv
 .agent/
 .docs/
-AGENTS.md
 .playwright-cli/

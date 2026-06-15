@@ -1,8 +1,0 @@
-Everytime review weak-label summary
-
-rows: 2
-course counts: {'자료구조': 2}
-workload counts: {1: 1, 5: 1}
-teamwork counts: {3: 2}
-grading counts: {3: 2}
-labeling method: keyword weak labeling, not manual ground truth

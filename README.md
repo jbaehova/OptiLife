@@ -1,10 +1,8 @@
 # OptiLife
 
-조건 기반 시간표 추천 MVP입니다. 학교 포털 과목 목록과 에브리타임 평가 지표를 담은 `courses.csv`를 사용해, UI에서 받은 조건에 맞는 시간표를 추천합니다.
-
 애플리케이션 레이어는 `data/csv/courses.csv`만 읽습니다. 리뷰 라벨링과 모델 실험 스크립트는 팀원이 오프라인으로 실행해 `courses.csv`의 course-level 평가 컬럼을 준비하는 용도입니다.
 
-- `data/csv/courses.csv`: 과목 목록과 에브리타임 course-level 평가 컬럼
+- `data/csv/courses.csv`: Course 목록과 course-level 평가 컬럼
 
 ## 구조
 
@@ -93,13 +91,4 @@ python3 scripts/label_everytime_reviews.py \
 ```bash
 python3 -m compileall app scripts
 python3 -m pytest
-```
-
-서버 실행 후 smoke test 예시는 아래와 같습니다.
-
-```bash
-curl -s http://127.0.0.1:8000/api/health
-curl -s -X POST http://127.0.0.1:8000/api/recommend \
-  -H 'Content-Type: application/json' \
-  -d '{"min_credits":15,"max_credits":18,"core_min_count":2,"core_max_count":4,"categories":["전공코어","전공심화","교양"],"limit":3}'
 ```

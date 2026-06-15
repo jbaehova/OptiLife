@@ -1,6 +1,0 @@
-course_name,credits,core,rating,workload_label,teamwork_load_label,grading_strictness_label,time_slot
-자료구조,3,true,4.2,2.4,4.7,3.1,Mon 09:00-10:30;Wed 09:00-10:30
-운영체제,3,true,3.8,2.0,4.3,2.7,Tue 10:30-12:00;Thu 10:30-12:00
-데이터베이스,3,true,4.4,3.6,4.6,3.9,Mon 13:00-14:30;Wed 13:00-14:30
-인공지능입문,3,false,4.1,3.0,4.0,3.4,Tue 14:00-15:30;Thu 14:00-15:30
-교양글쓰기,3,false,4.6,4.7,5.0,4.2,Fri 10:30-12:00
