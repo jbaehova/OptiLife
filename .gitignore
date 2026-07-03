@@ -16,6 +16,5 @@ outputs/
 data/previous/
 data/csv/courses.csv
 !data/csv/courses.csv
-.agent/
 .docs/
 .playwright-cli/
