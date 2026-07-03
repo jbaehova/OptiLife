@@ -17,20 +17,20 @@ uses those signals to rank possible timetables based on user preferences.
 - Scores schedules by credits, required-course constraints, preferred free days,
   early-class avoidance, Friday-afternoon avoidance, and daily workload balance
 - Serves a simple browser UI through FastAPI
-- Includes scripts for weak-labeling review data and training ML models directly
+- Includes scripts for training and evaluating review-based prediction models
 
 ## Machine Learning
 
 OptiLife includes its own model-building workflow for lecture review data.
 
-- `scripts/label_everytime_reviews.py` weak-labels raw review text into
-  workload, teamwork, and grading-strictness labels.
-- `scripts/train_difficulty_model.py` trains TF-IDF and logistic-regression
-  classifiers for review labels.
 - `scripts/train_course_attribute_model.py` fine-tunes a BERT-based regression
   model to predict course-level attributes from review text.
-- `scripts/evaluation/` contains cross-validation experiments and saved
-  comparison results.
+- `scripts/evaluation/tfidf_cv.py` runs TF-IDF based cross-validation
+  experiments for workload, teamwork, and grading-strictness targets.
+- `scripts/evaluation/bert_cv.py` contains the BERT cross-validation workflow.
+- `scripts/evaluation/evaluate_model2_comparison.py` and
+  `scripts/evaluation/evaluate_model2_ridge_features.py` evaluate additional
+  ridge and MLP-style prediction baselines.
 
 The recommendation app reads prepared course-level values from
 `data/csv/courses.csv`. Model training and evaluation are offline steps that
@@ -48,8 +48,6 @@ data/csv/
   labeled_everytime_reviews.csv
 scripts/
   recommend.py         Timetable search and scoring logic
-  label_everytime_reviews.py
-  train_difficulty_model.py
   train_course_attribute_model.py
   evaluation/          Model evaluation scripts and result files
 ```
@@ -122,22 +120,21 @@ python3 scripts/recommend.py \
   --output outputs/recommendations.txt
 ```
 
-Weak-label raw review data:
+Run TF-IDF cross-validation experiments:
 
 ```bash
-python3 scripts/label_everytime_reviews.py \
-  --input data/csv/raw_everytime_reviews.csv \
-  --output data/csv/labeled_everytime_reviews.csv \
-  --summary outputs/review_labeling_summary.txt \
-  --merge-existing
+python3 scripts/evaluation/tfidf_cv.py \
+  --raw data/csv/raw_everytime_reviews.csv \
+  --courses data/csv/courses.csv
 ```
 
-Train TF-IDF review-label models:
+Train the BERT course-attribute regressor:
 
 ```bash
-python3 scripts/train_difficulty_model.py \
-  --input data/csv/labeled_everytime_reviews.csv \
-  --output-dir outputs/review_label_model
+python3 scripts/train_course_attribute_model.py \
+  --raw data/csv/raw_everytime_reviews.csv \
+  --courses data/csv/courses.csv \
+  --output-dir outputs/course_attribute_model
 ```
 
 ## Verification
